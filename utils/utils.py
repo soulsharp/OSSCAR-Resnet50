@@ -41,7 +41,7 @@ def load_yaml(path):
     return None
 
 
-def count_parameters(model):
+def count_parameters(model, in_millions=True):
     """
     Counts the number of trainable parameters in a model.
 
@@ -52,7 +52,10 @@ def count_parameters(model):
         float: Number of parameters (in millions).
     """
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return params / 1000000
+    if in_millions:
+        return params / 1000000
+    else:
+        return params
 
 
 def get_topk_accuracy(logits, labels, k):

@@ -61,6 +61,35 @@ def build_eval_dataset(cfg):
     return dataset
 
 
+def build_calibration_dataloader(dataset, num_samples, batch_size=32):
+    """
+    Create a PyTorch DataLoader for a subset of a dataset to be used for calibration.
+
+    Parameters
+    ----------
+    dataset : torch.utils.data.Dataset
+        The full dataset to sample from.
+    num_samples : int
+        Number of samples from the start of the dataset to use for calibration.
+    batch_size : int, optional (default=32)
+        Batch size for the DataLoader.
+
+    Returns
+    -------
+    calibration_dataloader : torch.utils.data.DataLoader
+    """
+    calibration_dataloader = torch.utils.data.DataLoader(
+        dataset[:num_samples],
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    return calibration_dataloader
+
+
 def build_train_dataloader(dataset, config):
     """
     Wraps a dataset in a DataLoader for training.

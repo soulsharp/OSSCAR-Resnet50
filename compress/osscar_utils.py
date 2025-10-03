@@ -6,8 +6,8 @@ import torch
 from torch import nn
 
 from compress.heuristics import *
+from data.load_data import build_eval_dataloader, build_eval_dataset
 from model.resnet import resnet50
-from data.load_data import build_eval_dataset, build_eval_dataloader
 
 
 def reshape_filter(filter):
@@ -31,6 +31,7 @@ def reshape_filter(filter):
     reshaped_filter = reshaped_filter.reshape(-1, cout)
 
     return reshaped_filter
+
 
 def reshape_conv_layer_input(input, layer):
     """
@@ -121,11 +122,11 @@ def get_XtY(X, Y):
     Parameters
     ----------
     X : torch.Tensor
-        2D tensor of shape (N, D₁), typically an unfolded input/design matrix
+        2D tensor of shape (N, D₁), an unfolded input/design matrix
         from `reshape_conv_layer_input`, where N is the number of samples
-        (e.g., batch × sliding locations) and D₁ is the feature dimension.
+        (e.g., batch x sliding locations) and D₁ is the feature dimension.
     Y : torch.Tensor
-        2D tensor of shape (N, D₂), typically another unfolded tensor of
+        2D tensor of shape (N, D₂), another unfolded tensor of
         the same number of rows as `X`, but possibly with a different
         feature dimension D₂.
 
@@ -174,7 +175,8 @@ def get_coeff_g(dense_layer_weights, layer_input):
     G = torch.transpose(dense_layer_weights, dim0=0, dim1=1) @ layer_input
 
     return G
-    
+
+
 def compute_layer_loss(dense_weights, pruned_weights, input):
     """
     Compute the layer reconstruction loss using H and G coefficients.
@@ -409,57 +411,85 @@ def get_count_prune_channels(model, prune_percentage, allowable_tol=250):
 
     return num_channels_left_per_layer, p, remaining_params_to_prune
 
-def save_layer_input(activations, layer_name):
+
+def save_and_accumulate_layer_input(activations, layer_name):
     """
-    Factory function to create a forward hook that saves a layer’s output.
+    Create a forward hook that computes and accumulates a per-layer statistic
+    (e.g. Gram matrix) from the layer's input.
 
     Parameters
     ----------
     activations : dict
-        A dictionary (mutable) where the captured outputs will be stored.
-        Keys are layer names, values are the output tensors.
+        A mutable dictionary where the accumulated statistic will be stored.
+        Keys are layer names; values are initialized to 0 or an existing tensor.
     layer_name : str
-        Name under which to store this layer’s output in the `activations` dict.
+        Key under which to accumulate this layer's statistic in `activations`.
 
     Returns
     -------
     hook : callable
-        A forward hook function with signature (module, input, output)
-        that can be passed to `register_forward_hook`.
+        A forward hook with signature (module, input, output) suitable for
+        passing to `module.register_forward_hook`. On each forward pass,
+        it calls `get_coeff_h(design_matrix=input)` and adds the result to
+        `activations[layer_name]`.
+
+    Notes
+    -----
+    The hook expects the incoming `input` to be a 2-D tensor.
     """
+
     def hook(model, input, output):
-        activations[layer_name] = output.detach()
-        return hook
+        assert input.ndim == 2
+        coeff_h = get_coeff_h(design_matrix=input)
+        activations[layer_name] += coeff_h
+
+    return hook
 
 
 def register_hooks_to_collect_outs(prune_modules, prune_module_names, hook_fn):
     """
-    Register a forward hook on each module in `prune_modules` to collect outputs.
+    Attach forward hooks to a list of Conv2d modules to accumulate per-layer statistics.
 
     Parameters
     ----------
     prune_modules : list[nn.Module]
-        List of modules to attach hooks to (e.g. layers to prune).
+        The modules (layers) to attach hooks to (e.g. Conv2d layers to be pruned).
     prune_module_names : list[str]
-        Names corresponding to each module in `prune_modules`.
-        Must be the same length as `prune_modules`.
+        Names corresponding to each module in `prune_modules`. Must match length.
     hook_fn : callable
-        A factory function that accepts `activations` (dict) and `layer_name` (str)
-        and returns a forward hook with signature (module, input, output).
+        A factory that accepts (activations: dict, layer_name: str) and returns
+        a forward hook function. For example, `save_and_accumulate_layer_input`.
 
     Returns
     -------
     activations : dict
-        A dictionary that will be populated with {layer_name: output_tensor}
-        during a forward pass.
+        A dictionary keyed by `prune_module_names` whose values are initialized
+        to 0. On each forward pass, the registered hooks will add to these values.
+
+    Notes
+    -----
+    This utility is useful for computing and caching Gram matrices or other
+    layer input statistics over a calibration dataset before pruning.
     """
-    activations = {}
+    gram_activations = {name: 0.0 for name in prune_module_names}
     for idx, module in enumerate(prune_modules):
         assert isinstance(module, nn.Conv2d)
         module_name = prune_module_names[idx]
-        module.register_forward_hook(hook=hook_fn(activations=activations, layer_name=module_name))
-    
-    return activations
+        module.register_forward_hook(
+            hook=hook_fn(activations=gram_activations, layer_name=module_name)
+        )
+
+    return gram_activations
+
+
+def accumulate_xtx_statistics(model, calibration_dataloader):
+    """
+    Run the model over the calibration data to accumulate per-layer
+    XᵀX (Gram) matrices using registered forward hooks.
+    """
+    for images, _ in calibration_dataloader:
+        model(images)
+
 
 def recompute_X(prune_mask, X, layer_in_channels, kernel_height, kernel_width):
     """
@@ -485,23 +515,29 @@ def recompute_X(prune_mask, X, layer_in_channels, kernel_height, kernel_width):
         Pruned unfolded input matrix with rows corresponding only to kept input channels.
     """
     assert X.ndim == 2, "Weight matrix must have already been reshaped"
-    assert len(prune_mask) == layer_in_channels, "The length of the indicator vector and the number of in_channels must be the same"
+    assert (
+        len(prune_mask) == layer_in_channels
+    ), "The length of the indicator vector and the number of in_channels must be the same"
 
-    # Number of elements needed to represent one filter in_channel in the reshaped 2d weight matrix 
+    # Number of elements needed to represent one filter in_channel in the reshaped 2d weight matrix
     numel_one_channel = kernel_height * kernel_width
     _, X_width = X.shape
 
     slice_indices = np.arange(layer_in_channels)
     mask = np.ones(X_width, dtype=bool)
-    slice_indices = [(start * numel_one_channel, start * numel_one_channel + numel_one_channel) for start in slice_indices]
-    
+    slice_indices = [
+        (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
+        for start in slice_indices
+    ]
+
     for idx, indicator in enumerate(prune_mask):
         if not indicator:
             start, stop = slice_indices[idx]
             mask[start:stop] = False
-    
+
     return X[:, mask]
-    
+
+
 def recompute_H(prune_mask, H, kernel_height, kernel_width, activation_out_channels):
     """
     Recompute the coefficient matrix H after pruning output channels.
@@ -530,8 +566,11 @@ def recompute_H(prune_mask, H, kernel_height, kernel_width, activation_out_chann
     kept_indices = []
     numel_one_channel = kernel_height * kernel_width
     slice_indices = np.arange(activation_out_channels)
-    slice_indices = [(start * numel_one_channel, start * numel_one_channel + numel_one_channel) for start in slice_indices]
-    
+    slice_indices = [
+        (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
+        for start in slice_indices
+    ]
+
     for idx, indicator in enumerate(prune_mask):
         if not indicator:
             start, stop = slice_indices[idx]
@@ -540,7 +579,8 @@ def recompute_H(prune_mask, H, kernel_height, kernel_width, activation_out_chann
     H_updated = H[np.ix_(kept_indices, kept_indices)]
 
     return H_updated
-    
+
+
 def recompute_W(prune_mask, W, layer_in_channels, kernel_height, kernel_width):
     """
     Recompute the weight matrix W after pruning input channels.
@@ -564,36 +604,172 @@ def recompute_W(prune_mask, W, layer_in_channels, kernel_height, kernel_width):
         Pruned weight matrix with rows corresponding only to kept input channels.
     """
     assert W.ndim == 2, "Weight matrix must have already been reshaped"
-    assert len(prune_mask) == layer_in_channels, "The length of the indicator vector and the number of in_channels must be the same"
+    assert (
+        len(prune_mask) == layer_in_channels
+    ), "The length of the indicator vector and the number of in_channels must be the same"
 
-    # Number of elements needed to represent one filter in_channel in the reshaped 2d weight matrix 
+    # Number of elements needed to represent one filter in_channel in the reshaped 2d weight matrix
     numel_one_channel = kernel_height * kernel_width
     W_height, _ = W.shape
 
     slice_indices = np.arange(layer_in_channels)
     mask = np.ones(W_height, dtype=bool)
 
-    slice_indices = [(start * numel_one_channel, start * numel_one_channel + numel_one_channel) for start in slice_indices]
+    slice_indices = [
+        (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
+        for start in slice_indices
+    ]
     print(slice_indices)
 
     for idx, indicator in enumerate(prune_mask):
         if not indicator:
             start, stop = slice_indices[idx]
             mask[start:stop] = False
-    
+
     return W[mask, :]
 
 
-def get_optimal_W(pruned_activation, dense_activation, dense_weights):
-    assert isinstance(pruned_activation, torch.Tensor)
-    assert isinstance(dense_activation, torch.Tensor)
+def compute_X_via_cholesky(A, B, C, eig_fallback_tol=1e-12):
+    """
+    Compute X = A^{-1} @ (B @ C) assuming A is PSD (possibly singular).
+    - Adds jitter to A (A_reg = A + jitter*I).
+    - Attempts Cholesky. If it fails, falls back to eigendecomposition-based solve.
+    Returns X with same dtype/device as inputs.
+    """
+    assert A.ndim == 2 and A.shape[0] == A.shape[1], "A must be square"
+    Y = B @ C  
+    n = A.shape[0]
+    device = A.device
+    dtype = A.dtype
+    jitter = 1e-6
+
+    # Adpative scaling for proper regularization to treat ill-conditioned matrices
+    scale = max(torch.trace(A).abs().item() / n, torch.linalg.matrix_norm(A, ord='fro').item() / (n**0.5), 1.0)
+    lambda_j = jitter * scale
+    A_reg = A + lambda_j * torch.eye(n, device=device, dtype=dtype)
+
+    # Cholesky decomposition only if A_ref is positive definite(SPD)
+    L, info = torch.linalg.cholesky_ex(A_reg)
+    if info == 0:
+        # LL^T X = Y  =>  L Z = Y, then L^T X = Z
+        Z = torch.linalg.solve_triangular(L, Y, upper=False, left=True)   
+        X = torch.linalg.solve_triangular(L.transpose(-2, -1), Z, upper=True, left=True)
+        return X
+
+    # Fallback: eigen-decomposition for PSD 
+    eigvals, eigvecs = torch.linalg.eigh(A) 
+    reg_eig = eigvals + lambda_j
+    # If reg_eig very small, clamp with tol
+    reg_eig_clamped = torch.where(reg_eig.abs() < eig_fallback_tol, torch.full_like(reg_eig, eig_fallback_tol), reg_eig)
+
+    # X = V diag(1/reg_eig_clamped) V^T Y  
+    VtY = eigvecs.transpose(-2, -1) @ Y    
+    scaled = VtY / reg_eig_clamped.unsqueeze(-1)
+    X = eigvecs @ scaled
+    return X
+
+
+def get_optimal_W(gram_xx, gram_xy, dense_weights):
+    """
+    Compute the optimal weight matrix for a layer in OSSCAR using precomputed Gram matrices.
+
+    This function solves for W* in the least-squares sense:
+        min_W ||X W - Y||_F^2
+    where:
+        - gram_xx = X^T X
+        - gram_xy = X^T Y_dense
+        - dense_weights = Y_dense reshaped as 2D matrix
+
+    It handles potentially ill-conditioned or nearly singular Gram matrices using
+    adaptive Tikhonov regularization. Depending on the conditioning, it either:
+        1. Uses Cholesky decomposition if the matrix is SPD.
+        2. Falls back to eigen-decomposition with clamping for positive semi-definite cases.
+
+    Parameters
+    ----------
+    gram_xx : torch.Tensor, shape (N, N)
+        The input Gram matrix X^T X. Must be square.
+    gram_xy : torch.Tensor, shape (N, N)
+        The cross Gram matrix X^T Y_dense. Must be square.
+    dense_weights : torch.Tensor, shape (N, N)
+        The target dense weight matrix reshaped to 2D.
+
+    Returns
+    -------
+    torch.Tensor, shape (N, N)
+        The optimal weight matrix W* for the current layer.
+
+    Notes
+    -----
+    - Adds adaptive regularization proportional to the trace and Frobenius norm of `gram_xx`.
+    - Uses `torch.linalg.cholesky_ex` to safely attempt Cholesky decomposition.
+    - If Cholesky fails (matrix not SPD), falls back to eigen-decomposition and clamps small eigenvalues.
+    - Intended to be called once per layer during the first OSSCAR iteration.
+
+    Raises
+    ------
+    AssertionError
+        If input tensors are not 2D, or if shapes do not match as expected.
+    """
+
+    assert isinstance(gram_xx, torch.Tensor)
+    assert isinstance(gram_xy, torch.Tensor)
     assert isinstance(dense_weights, torch.Tensor)
 
-    assert pruned_activation.ndim == 2, "Pruned activation should be 2D"
-    assert dense_activation.ndim == 2, "Dense activation should have been reshaped to 2D"
+    assert gram_xx.ndim == 2, "Gram matrix XtX should be 2D"
+    assert (
+        gram_xy.ndim == 2
+    ), "Gram matrix XtY should be 2D"
     assert dense_weights.ndim == 2, "Weights should have been reshaped to 2D"
+    assert gram_xx.shape[0] == gram_xx.shape[1], "Gram_xx must be square"
+    assert gram_xy.shape[0] == gram_xy.shape[1], "Gram_xy must be square"
 
-def get_calibration_dataset():
+    Y = gram_xy @ dense_weights  
+    n = gram_xx.shape[0]
+    device = gram_xx.device
+    dtype = gram_xx.dtype
+    jitter = 1e-6
+    eig_fallback_tol = 1e-12
+
+    # Adpative scaling for proper regularization to treat ill-conditioned matrices
+    scale = max(torch.trace(gram_xx).abs().item() / n, torch.linalg.matrix_norm(gram_xx, ord='fro').item() / (n**0.5), 1.0)
+    lambda_j = jitter * scale
+    gram_xx_reg = gram_xx + lambda_j * torch.eye(n, device=device, dtype=dtype)
+
+    # Cholesky decomposition only if gram_xx_reg is positive definite(SPD)
+    L, info = torch.linalg.cholesky_ex(gram_xx_reg)
+    if info == 0:
+        # LL^T X = Y  =>  L Z = Y, then L^T X = Z
+        Z = torch.linalg.solve_triangular(L, Y, upper=False, left=True)   
+        X = torch.linalg.solve_triangular(L.transpose(-2, -1), Z, upper=True, left=True)
+        return X
+
+    # Fallback: eigen-decomposition for PSD 
+    eigvals, eigvecs = torch.linalg.eigh(gram_xx) 
+    reg_eig = eigvals + lambda_j
+    # If reg_eig very small, clamp with tol
+    reg_eig_clamped = torch.where(reg_eig.abs() < eig_fallback_tol, torch.full_like(reg_eig, eig_fallback_tol), reg_eig)
+
+    # X = V diag(1/reg_eig_clamped) V^T Y  
+    VtY = eigvecs.transpose(-2, -1) @ Y    
+    scaled = VtY / reg_eig_clamped.unsqueeze(-1)
+    X = eigvecs @ scaled
+    return X
+
+# def run_submodules_from_start_to_end_layer(
+#     start_layer_name, end_layer_name, model, input
+# ):
+#     assert isinstance(model, nn.Module)
+#     x = input
+#     fwd_flag = False
+#     for name, module in model.named_modules():
+#         if name == start_layer_name:
+#             fwd_flag = True
+
+#         if fwd_flag and name == end_layer_name:
+#             return x
+#         elif fwd_flag:
+#             x = module(x)
 
 
 if __name__ == "__main__":
@@ -611,7 +787,7 @@ if __name__ == "__main__":
     # inp = inp.flatten(1)
 
     # # print(inp.shape)
-    # model = resnet50(pretrained=True)
+    model = resnet50(pretrained=True)
     # overall_prune_percentage = 0.3
     # # _, p, rem_params = get_count_prune_channels(
     # #     model=model, prune_percentage=overall_prune_percentage
@@ -624,39 +800,41 @@ if __name__ == "__main__":
     # slice_indices = np.arange(layer_in_channels, dtype=np.int32)
     # slice_indices = [(start * numel_one_channel, start * numel_one_channel + numel_one_channel - 1) for start in slice_indices]
     # print(slice_indices)
-    
 
     # z = np.random.randint(low=0, high=2, size=layer_in_channels)
     # print("Z:", z)
     # W = np.random.randn(27, 1)
     # print("W before: ", W)
     # print("W after: ", get_matrix_I(z, W, layer_in_channels, 3, 3))
-    
+
     # layer_input = torch.randn((3, 3, 4))
     # output = get_coeff_h(layer_input)
     # print(output.shape)
 
-    input_activation = torch.randn(2, 3, 32, 32)
-    pruned_activation = torch.randn(2, 2, 32, 32)
-    mini_conv = nn.Conv2d(padding=1, kernel_size=3, in_channels=3, out_channels=8)
-    
-    out = reshape_conv_layer_input(input_activation, mini_conv)
+    # input_activation = torch.randn(2, 3, 32, 32)
+    # pruned_activation = torch.randn(2, 2, 32, 32)
+    # mini_conv = nn.Conv2d(padding=1, kernel_size=3, in_channels=3, out_channels=8)
 
-    W = reshape_filter(mini_conv.weight)
-    print(f"Reshaped W before pruning: {W.shape}")
+    # out = reshape_conv_layer_input(input_activation, mini_conv)
 
-    prune_mask = [1, 1, 0]
-    W_pruned = recompute_W(prune_mask, W, layer_in_channels=3, kernel_height=3, kernel_width=3)
+    # W = reshape_filter(mini_conv.weight)
+    # print(f"Reshaped W before pruning: {W.shape}")
 
-    print(f"Reshaped W after pruning: {W_pruned.shape}")
-    
-    print("Reshaped activation shape before pruning:", out.shape)
+    # prune_mask = [1, 1, 0]
+    # W_pruned = recompute_W(prune_mask, W, layer_in_channels=3, kernel_height=3, kernel_width=3)
 
-    X = recompute_X(prune_mask=prune_mask, X=out, layer_in_channels=3, kernel_height=3, kernel_width=3)
+    # print(f"Reshaped W after pruning: {W_pruned.shape}")
 
-    print("Reshaped activation shape after pruning:", X.shape)
+    # print("Reshaped activation shape before pruning:", out.shape)
 
-    corr = get_XtY(out, X)
-    print("XtY shape", corr.shape)
+    # X = recompute_X(prune_mask=prune_mask, X=out, layer_in_channels=3, kernel_height=3, kernel_width=3)
 
-    print(get_coeff_h(out).shape)
+    # print("Reshaped activation shape after pruning:", X.shape)
+
+    # corr = get_XtY(out, X)
+    # print("XtY shape", corr.shape)
+
+    # print(get_coeff_h(out).shape)
+
+    # print(model.named_children)
+
