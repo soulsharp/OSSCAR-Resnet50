@@ -42,7 +42,7 @@ def collect_convolution_layers_to_prune(model: nn.Module):
     Collect convolutional layers from a model that are eligible for pruning.
 
     By default this picks all modules whose name contains 'conv' but does not
-    end with 'conv3' (e.g. skips the final 1×1 conv in ResNet bottlenecks).
+    end with 'conv3' (e.g. skips the final 1x1 conv in ResNet bottlenecks).
 
     Parameters
     ----------
