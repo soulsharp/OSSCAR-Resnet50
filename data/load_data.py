@@ -61,9 +61,9 @@ def build_eval_dataset(cfg):
     return dataset
 
 
-def build_calibration_dataloader(dataset, num_samples, batch_size=32):
+def build_calibration_dataloader(dataset, num_samples, g, batch_size=32):
     """
-    Create a PyTorch DataLoader for a subset of a dataset to be used for calibration.
+    Create a reproducible PyTorch DataLoader for a subset of a dataset to be used for calibration.
 
     Parameters
     ----------
@@ -71,20 +71,30 @@ def build_calibration_dataloader(dataset, num_samples, batch_size=32):
         The full dataset to sample from.
     num_samples : int
         Number of samples from the start of the dataset to use for calibration.
+    g : torch.Generator
+        A PyTorch random number generator with a fixed manual seed. Ensures
+        deterministic shuffling of samples within the DataLoader.
     batch_size : int, optional (default=32)
         Batch size for the DataLoader.
 
     Returns
     -------
     calibration_dataloader : torch.utils.data.DataLoader
+        A DataLoader whose batch contents and order are fixed across runs
+        when combined with deterministic seeding.
     """
+    from utils.utils import seed_worker
+    subset_indices = list(range(num_samples))
+    subset = torch.utils.data.Subset(dataset, subset_indices)
     calibration_dataloader = torch.utils.data.DataLoader(
-        dataset[:num_samples],
+        subset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=2,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
 
     return calibration_dataloader
