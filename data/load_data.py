@@ -84,6 +84,7 @@ def build_calibration_dataloader(dataset, num_samples, g, batch_size=32):
         when combined with deterministic seeding.
     """
     from utils.utils import seed_worker
+
     subset_indices = list(range(num_samples))
     subset = torch.utils.data.Subset(dataset, subset_indices)
     calibration_dataloader = torch.utils.data.DataLoader(
