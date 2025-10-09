@@ -559,88 +559,13 @@ def prune_one_layer(
     return pruned_subnet, keep_mask
 
 
-# def osscar_prune(
-#     dense_subnet,
-#     prune_subnet,
-#     dense_input,
-#     pruned_input,
-#     cached_dense_out,
-#     cached_prune_out,
-#     layer_name,
-#     prune_layer_counts,
-# ):
-#     assert isinstance(dense_subnet, nn.Module), "Needs a valid subnet(nn.Module)"
-#     assert isinstance(prune_subnet, nn.Module), "Needs a valid subnet(nn.Module)"
-#     assert isinstance(dense_input, torch.Tensor)
-#     assert isinstance(pruned_input, torch.Tensor)
-#     assert pruned_input.ndim == 4, "Pruned input tensor must be of the shape N, B_sz, C, H, W"
-#     assert dense_input.ndim == 4, "Dense input tensor must be of the shape N, B_sz, C, H, W"
-
-#     num_batches = dense_input.shape[0]
-#     batch_size = dense_input.shape[1]
-#     conv_module = None
-#     reshaped_conv_wt = None
-
-#     # The way subnets are designed makes the first module of a subnet the conv2d thats needed to be pruned
-#     for _, module in dense_subnet.named_modules():
-#         conv_module = module
-#         assert isinstance(conv_module, nn.Conv2d)
-#         reshaped_conv_wt = reshape_filter(conv_module.weight)
-#         break
-
-#     # print(conv_module)
-
-#     assert (
-#         num_batches == pruned_input.shape[0] and batch_size == pruned_input.shape[1]
-#     ), "Dense and prune inputs must have the same number of images(batch_size * num_batches)"
-
-#     total_xtx = 0
-#     total_xty = 0
-
-#     # Takes in one batch at a time to reshape and calculate the gram matrices
-#     for batch_idx in range(num_batches):
-#         dense_batch = dense_input[batch_idx, :, :, :, :].squeeze(0)
-#         pruned_batch = pruned_input[batch_idx, :, :, :, :].squeeze(0)
-#         dense_batch = reshape_conv_layer_input(input=dense_batch, layer=conv_module)
-#         pruned_batch = reshape_conv_layer_input(input=pruned_batch, layer=conv_module)
-#         total_xtx += get_coeff_h(pruned_batch) / batch_size
-#         total_xty += get_XtY(pruned_batch, dense_batch) / batch_size
-
-#     # Note to self: Remember to double check
-#     total_xtx /= num_batches
-#     total_xty /= num_batches
-
-#     w_optimal = get_optimal_W(
-#         gram_xx=total_xtx, gram_xy=total_xty, dense_weights=reshaped_conv_wt
-#     )
-
-
-# # Note to self: prune_layer_counts is supposed to be a dicttionary now, beware, dont forget to change
-# p = prune_layer_counts["layer_name"]
-# pruned_layer = perform_local_search(
-#     w_optimal=w_optimal, layer=conv_module, prune_layer_counts
-# )
-
-# Perform forward till the next layer to be pruned and cache results
-# dense_out = dense_subnet(dense_input[batch_idx, :, :, :])
-# prune_out = prune_subnet(pruned_input[batch_idx, :, :, :])
-
-# cached_out =
-
-
 if __name__ == "__main__":
     model = resnet50(pretrained=True)
     input = torch.randn(1, 3, 224, 224)
-
     weights = model.conv1.weight
-    # print(weights.shape)
-
-    # model.conv1.weight = weights[:, :2, :, :]
-
     prune_conv_modules, prune_modules_name = collect_convolution_layers_to_prune(
         model=model
     )
-
     reformatted = []
     for name in prune_modules_name:
         reformatted_name = "_".join(name.split("."))
@@ -653,41 +578,3 @@ if __name__ == "__main__":
         graph_module=gm, prune_modules_name=prune_modules_name
     )
     assert len(prune_subnets) == len(dense_subnets)
-
-    print(prune_subnets[0])
-    print(dense_subnets[1])
-    # prefix_gm, remap = get_initial_prefix_submodule(graph_module=gm, end_node=end)
-
-    # start_node = reformatted[0]
-    # end_node = reformatted[1]
-
-    # subnet, remap_dict = get_fx_submodule(
-    #     graph_module=gm, value_remap=remap, start_node=start_node, end_node=end_node
-    # )
-
-    # out = prefix_gm(input)
-    # # print(out.shape)
-
-    # # out = out[:, :2, :, :]
-    # # model.conv1.weight = torch.nn.Parameter(weights[:, :2, :, :], requires_grad=True)
-
-    # out = subnet(out)
-
-    # print(subnet.conv1)
-
-    # print(out.shape)
-
-    # outputs = {}
-
-    # def hook_fn(model, input, output):
-    #     outputs["maxpool"] = output
-
-    # model.maxpool.register_forward_hook(hook_fn)
-    # model(input)
-    # print(outputs["maxpool"].shape)
-
-    # suffix_module, remap_final = get_suffix_submodule(
-    #     graph_module=gm, value_remap=remap, start_node=end_node
-    # )
-    # out = suffix_module(out)
-    # # print(suffix_module)
