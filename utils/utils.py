@@ -1,3 +1,6 @@
+import random
+
+import numpy as np
 import torch
 import yaml
 
@@ -95,3 +98,22 @@ def return_train_val_cfg(path):
     val_cfg = cfg["eval"]
 
     return train_cfg, val_cfg
+
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def safe_free(*tensors):
+    """Explicitly free tensors and clear cache if on GPU."""
+    for t in tensors:
+        del t
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
