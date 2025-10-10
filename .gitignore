@@ -210,3 +210,4 @@ __marimo__/
 /data/test
 /profiler/trace.json
 /logs/profiler
+/.vscode

@@ -1,4 +1,5 @@
 from typing import Optional
+
 import numpy as np
 import torch
 import torch.fx as fx
@@ -6,11 +7,13 @@ from torch import nn
 
 from compress.heuristics import collect_convolution_layers_to_prune
 from compress.osscar_utils import (
-    get_XtY,
     get_coeff_h,
+    get_optimal_W,
+    get_XtY,
+    recompute_H,
+    recompute_W,
     reshape_conv_layer_input,
     reshape_filter,
-    get_optimal_W,
 )
 from model.resnet import resnet50
 
@@ -251,121 +254,318 @@ def get_all_subnets(prune_modules_name, graph_module):
     return prune_subnets, dense_subnets
 
 
+def evaluate_loss(submatrix_w_pruned, dense_weights, subgram_xx, subgram_xy):
+    """
+    Compute the OSSCAR-style loss for a candidate pruned set of channels.
+
+    Parameters
+    ----------
+    submatrix_w_pruned : torch.Tensor
+        Weight matrix corresponding to the pruned channels.
+    dense_weights : torch.Tensor
+        Original dense weight matrix of the layer.
+    subgram_xx : torch.Tensor
+        Gram matrix of pruned activations (X^T X for pruned channels).
+    subgram_xy : torch.Tensor
+        Cross Gram matrix between pruned activations and dense outputs (X^T Y).
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss measuring reconstruction error for the pruned channels.
+    """
+    A = (submatrix_w_pruned.T @ subgram_xx) @ submatrix_w_pruned
+    B = (dense_weights.T @ subgram_xy) @ dense_weights
+    return torch.trace(A) - 2 * torch.trace(B)
+
+
 def perform_local_search(
-    w_optimal,
+    dense_weights,
     layer,
     p,
-    prune_by_iter: Optional[list],
-    sym_diff_per_iter: Optional[list],
+    gram_xx,
+    gram_xy,
+    prune_by_iter: Optional[list] = None,
+    sym_diff_per_iter: Optional[list] = None,
     prune_per_iter=2,
 ):
+    """
+    Greedy local search to select which input channels to prune in a Conv2d layer.
+
+    Iteratively evaluates the importance of each input channel using Gram matrices
+    (X^T X and X^T Y) and prunes the least important channels according to the
+    specified schedule.
+
+    Args:
+        dense_weights (torch.Tensor): Original dense weight matrix of the layer.
+        layer (nn.Conv2d): Convolutional layer to prune.
+        p (int): Total number of channels to prune.
+        gram_xx (torch.Tensor): Full Gram matrix of layer inputs (X^T X).
+        gram_xy (torch.Tensor): Cross Gram matrix between layer inputs and outputs (X^T Y).
+        prune_by_iter (list, optional): Custom pruning schedule per iteration.
+        sym_diff_per_iter (list, optional): Symmetric difference allowed per iteration.
+        prune_per_iter (int, default=2): Number of channels to prune per iteration
+            (ignored if `prune_by_iter` is provided).
+
+    Returns:
+        keep_mask (torch.BoolTensor): Boolean mask of channels to keep (`True`) or prune (`False`).
+        kept_channels (set): Indices of channels retained after pruning.
+        removed_channels (set): Indices of channels removed during pruning.
+    """
     assert isinstance(layer, nn.Conv2d)
     assert isinstance(p, int) and p > 0
+
+    # Determine pruning schedule
     if prune_by_iter is None:
         prune_list = []
         num_iterations = p // prune_per_iter
         rem = p % prune_per_iter
-        zero_set = set()
-
         if p >= prune_per_iter:
-            prune_list.extend([prune_per_iter for i in range(num_iterations)])
+            prune_list.extend([prune_per_iter for _ in range(num_iterations)])
         if rem > 0:
-            prune_list.extend([rem])
+            prune_list.append(rem)
     else:
-
         assert np.sum(np.array(prune_by_iter)) == p
         prune_list = prune_by_iter
 
     if sym_diff_per_iter is not None:
         assert len(prune_list) == len(sym_diff_per_iter)
         assert all(p <= t for p, t in zip(prune_list, sym_diff_per_iter))
-
     else:
         sym_diff_per_iter = prune_list
 
-    # for i in range(len(sym_diff_per_iter)):
-    #     num_prune_iter = sym_diff_per_iter[]
+    kept_channels = set(range(layer.in_channels))
+    removed_channels = set()
+    total_channels = kept_channels.copy()
+    keep_mask = torch.ones(layer.in_channels, dtype=torch.bool)
+
+    # Iterative greedy pruning, where t=p and hence s1 = 0
+    for i in range(len(prune_list)):
+        num_prune_iter = prune_list[i]
+        sym_diff_iter = sym_diff_per_iter[i]
+        s1 = (sym_diff_iter - num_prune_iter) // 2
+        s2 = (sym_diff_iter + num_prune_iter) // 2
+
+        assert kept_channels.union(removed_channels) == total_channels
+
+        channel_importance_dict = {}
+
+        # Evaluate loss increase if each kept channel were pruned
+        for channel in kept_channels:
+            temp_keep_mask = keep_mask.clone()
+            temp_keep_mask[channel] = False
+
+            subgram_xx = recompute_H(
+                prune_mask=temp_keep_mask,
+                H=gram_xx,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+                activation_in_channels=layer.in_channels,
+                is_pure_gram=True,
+            )
+            subgram_xy = recompute_H(
+                prune_mask=temp_keep_mask,
+                H=gram_xy,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+                activation_in_channels=layer.in_channels,
+                is_pure_gram=False,
+            )
+            # sub_w_optimal = recompute_W(
+            #     prune_mask=temp_keep_mask,
+            #     W=w_optimal,
+            #     activation_in_channels=layer.in_channels,
+            #     kernel_height=layer.kernel_size[0],
+            #     kernel_width=layer.kernel_size[1],
+            # )
+            submatrix_w_pruned = recompute_W(
+                prune_mask=temp_keep_mask,
+                W=dense_weights,
+                activation_in_channels=layer.in_channels,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+            )
+
+            loss = evaluate_loss(
+                submatrix_w_pruned, dense_weights, subgram_xx, subgram_xy
+            )
+            channel_importance_dict[channel] = loss.item()
+
+        # Sort channels by importance(ascending = least important first)
+        sorted_channels = [
+            k
+            for k, _ in sorted(
+                channel_importance_dict.items(), key=lambda item: item[1]
+            )
+        ]
+
+        # Prune s2 least important channels
+        to_prune = sorted_channels[:s2]
+        for channel in to_prune:
+            keep_mask[channel] = False
+            kept_channels.remove(channel)
+            removed_channels.add(channel)
+
+        print(
+            f"Iteration {i+1}: pruned {len(to_prune)} channels, {len(kept_channels)} remaining."
+        )
+
+    return keep_mask, kept_channels, removed_channels
 
 
-def osscar_prune(
-    dense_subnet,
-    prune_subnet,
-    dense_input,
-    pruned_input,
-    cached_dense_out,
-    cached_prune_out,
-    layer_name,
-    prune_layer_counts,
+def get_parent_module(model, target_module):
+    """Find the direct parent and name of a given submodule.
+
+    Iterates through all modules in `model` to locate the one that directly contains
+    `target_module`.
+
+    Args:
+        model (nn.Module): Root model to search.
+        target_module (nn.Module): Submodule to locate.
+
+    Returns:
+        (nn.Module, str): Parent module and the submodule's attribute name.
+
+    Raises:
+        ValueError: If the target module isn’t found.
+    """
+    for _, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if child is target_module:
+                return module, child_name
+    raise ValueError("Target module not found")
+
+
+def replace_module(model, target_module, new_module):
+    """Replace a submodule in-place within a model.
+
+    Finds the parent of `target_module` using `get_parent_module` and swaps it with
+    `new_module` via `setattr`.
+
+    Args:
+        model (nn.Module): Root model.
+        target_module (nn.Module): Module to replace.
+        new_module (nn.Module): Replacement module.
+    """
+    parent, name = get_parent_module(model, target_module)
+    setattr(parent, name, new_module)
+
+
+def prune_one_layer(
+    dense_subnet, pruned_subnet, dense_input, pruned_input, layer_prune_channels
 ):
-    assert isinstance(dense_subnet, nn.Module), "Needs a valid subnet(nn.Module)"
-    assert isinstance(prune_subnet, nn.Module), "Needs a valid subnet(nn.Module)"
-    assert isinstance(dense_input, torch.Tensor)
-    assert isinstance(pruned_input, torch.Tensor)
-    assert pruned_input.ndim == 4, "Pruned input tensor must be of the shape B, C, H, W"
-    assert dense_input.ndim == 4, "Dense input tensor must be of the shape B, C, H, W"
+    """
+    Prune a single Conv2d layer from a subnet and replace it with a smaller version.
 
-    num_batches = dense_input.shape[0]
-    conv_module = None
-    reshaped_conv_wt = None
+    Uses Gram matrices of the layer inputs and outputs to evaluate channel importance
+    and greedily prune the least important input channels. Replaces the original
+    layer in `pruned_subnet` with a new Conv2d containing only the kept channels.
 
-    # The way subnets are designed nmakes the first module of a subnet the conv2d thats needed to be pruned
-    for _, module in dense_subnet.named_modules():
-        conv_module = module
-        assert isinstance(conv_module, nn.Conv2d)
-        reshaped_conv_wt = reshape_filter(conv_module.weight)
-        break
+    Args:
+        dense_subnet (nn.Module): Full, unpruned reference subnet.
+        pruned_subnet (nn.Module): Subnet to be pruned and modified.
+        dense_input (Tensor): Dense model inputs of shape (num_batches, batch_size, C, H, W).
+        pruned_input (Tensor): Pruned model inputs of the same shape.
+        layer_prune_channels (int): Number of channels to prune in this layer.
 
-    print(conv_module)
-
+    Returns:
+        pruned_subnet (nn.Module): Updated subnet with the pruned layer replaced.
+        keep_mask (torch.BoolTensor): Boolean mask indicating which channels were kept.
+    """
     assert (
-        num_batches == pruned_input.shape[0]
-    ), "Dense and prune inputs must have the same number of images"
+        dense_input.ndim == 5 and pruned_input.ndim == 5
+    ), "Inputs must be (num_batches, batch_size, C, H, W)"
 
-    total_xtx = 0
-    total_xty = 0
+    num_batches, batch_size, C, H, W = dense_input.shape
+    N = num_batches * batch_size
 
-    for batch_idx in range(num_batches):
-        dense_batch = dense_input[batch_idx, :, :, :]
-        pruned_batch = pruned_input[batch_idx, :, :, :]
-        dense_batch = reshape_conv_layer_input(input=dense_batch, layer=conv_module)
-        pruned_batch = reshape_conv_layer_input(input=pruned_batch, layer=conv_module)
-        total_xtx += get_coeff_h(pruned_batch)
-        total_xty += get_XtY(pruned_batch, dense_batch)
-
-    # Note to self: Remember to double check
-    total_xtx /= num_batches
-    total_xty /= num_batches
-
-    w_optimal = get_optimal_W(
-        gram_xx=total_xtx, gram_xy=total_xty, dense_weights=reshaped_conv_wt
+    # Get conv module to prune
+    conv_module = next(
+        m for _, m in pruned_subnet.named_modules() if isinstance(m, nn.Conv2d)
     )
+    reshaped_conv_wt = reshape_filter(conv_module.weight)
 
-    # Note to self: prune_layer_counts is supposed to be a dicttionary now, beware, dont forget to change
-    p = prune_layer_counts["layer_name"]
-    # pruned_layer = perform_local_search(
-    #     w_optimal, layer_name, prune_layer_counts
+    # Flatten all images into one dimension and reshape for gram_matrices calculation
+    dense_input_flat = dense_input.reshape(N, C, H, W)
+    pruned_input_flat = pruned_input.reshape(N, C, H, W)
+    dense_X = reshape_conv_layer_input(dense_input_flat, conv_module)
+    pruned_X = reshape_conv_layer_input(pruned_input_flat, conv_module)
+
+    # Compute gram matrices over all N images
+    total_xtx = get_coeff_h(pruned_X) / N
+    total_xty = get_XtY(pruned_X, dense_X) / N
+
+    # # Optimal weights
+    # w_optimal = get_optimal_W(
+    #     gram_xx=total_xtx, gram_xy=total_xty, dense_weights=reshaped_conv_wt
     # )
 
-    # Perform forward till the next layer to be pruned and cache results
-    # dense_out = dense_subnet(dense_input[batch_idx, :, :, :])
-    # prune_out = prune_subnet(pruned_input[batch_idx, :, :, :])
+    keep_mask, kept_channels, removed_channels = perform_local_search(
+        dense_weights=reshaped_conv_wt,
+        layer=conv_module,
+        p=layer_prune_channels,
+        gram_xx=total_xtx,
+        gram_xy=total_xty,
+    )
 
-    # cached_out =
+    cached_out_pruned = []
+    cached_out_dense = []
+
+    for batch_idx in range(num_batches):
+        cached_out_pruned.append(pruned_subnet(pruned_input[batch_idx]))
+        cached_out_dense.append(dense_subnet(dense_input[batch_idx]))
+
+    cached_out_pruned = torch.cat(cached_out_pruned, dim=0)
+    cached_out_dense = torch.cat(cached_out_dense, dim=0)
+
+    new_weight = conv_module.weight[:, keep_mask, :, :]
+    if conv_module.bias is not None:
+        new_bias = conv_module.bias
+    else:
+        new_bias = None
+
+    kernel_size = conv_module.kernel_size
+    stride = conv_module.stride
+    padding = conv_module.padding
+    dilation = conv_module.dilation
+
+    # Pylance fix
+    kernel_size_2 = (kernel_size[0], kernel_size[1])
+    stride_2 = (stride[0], stride[1])
+    padding_2 = (padding[0], padding[1])
+    dilation_2 = (dilation[0], dilation[1])
+
+    # Replacement module
+    new_conv_module = nn.Conv2d(
+        in_channels=conv_module.in_channels,
+        out_channels=conv_module.out_channels - 1,
+        kernel_size=kernel_size_2,
+        stride=stride_2,
+        padding=padding_2,
+        dilation=dilation_2,
+        groups=conv_module.groups,
+        bias=conv_module.bias is not None,
+    )
+
+    # Replace weights
+    new_conv_module.weight.data = new_weight.clone()
+    if new_bias is not None:
+        new_conv_module.bias.data = new_bias.clone()
+
+    replace_module(
+        model=pruned_subnet, target_module=conv_module, new_module=new_conv_module
+    )
+
+    return pruned_subnet, keep_mask
 
 
 if __name__ == "__main__":
     model = resnet50(pretrained=True)
     input = torch.randn(1, 3, 224, 224)
-
     weights = model.conv1.weight
-    # print(weights.shape)
-
-    # model.conv1.weight = weights[:, :2, :, :]
-
     prune_conv_modules, prune_modules_name = collect_convolution_layers_to_prune(
         model=model
     )
-
     reformatted = []
     for name in prune_modules_name:
         reformatted_name = "_".join(name.split("."))
@@ -378,64 +578,3 @@ if __name__ == "__main__":
         graph_module=gm, prune_modules_name=prune_modules_name
     )
     assert len(prune_subnets) == len(dense_subnets)
-
-    print(prune_subnets[0])
-    print(dense_subnets[1])
-    # prefix_gm, remap = get_initial_prefix_submodule(graph_module=gm, end_node=end)
-
-    # start_node = reformatted[0]
-    # end_node = reformatted[1]
-
-    # subnet, remap_dict = get_fx_submodule(
-    #     graph_module=gm, value_remap=remap, start_node=start_node, end_node=end_node
-    # )
-
-    # out = prefix_gm(input)
-    # # print(out.shape)
-
-    # # out = out[:, :2, :, :]
-    # # model.conv1.weight = torch.nn.Parameter(weights[:, :2, :, :], requires_grad=True)
-
-    # out = subnet(out)
-
-    # print(subnet.conv1)
-
-    # print(out.shape)
-
-    # outputs = {}
-
-    # def hook_fn(model, input, output):
-    #     outputs["maxpool"] = output
-
-    # model.maxpool.register_forward_hook(hook_fn)
-    # model(input)
-    # print(outputs["maxpool"].shape)
-
-    # suffix_module, remap_final = get_suffix_submodule(
-    #     graph_module=gm, value_remap=remap, start_node=end_node
-    # )
-    # out = suffix_module(out)
-    # # print(suffix_module)
-
-    # direct_out = model(input)
-
-    # assert torch.allclose(out, direct_out)
-    # print(out.shape)
-    # print(direct_out.shape)
-
-    # perform_local_search()
-    p = 1
-    prune_per_iter = 3
-    num_iterations = p // prune_per_iter
-    rem = p % prune_per_iter
-    zero_set = set()
-    sym_diff_per_iter = []
-    # while p > 1:
-    #     p = p - prune_per_iter
-    #     sym_diff_per_iter.extend([prune_per_iter])
-    if p >= prune_per_iter:
-        sym_diff_per_iter.extend([prune_per_iter for i in range(num_iterations)])
-    if rem > 0:
-        sym_diff_per_iter.extend([rem])
-    print(sym_diff_per_iter)
-    # for
