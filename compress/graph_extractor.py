@@ -1,4 +1,6 @@
 from typing import Optional
+from itertools import chain
+import copy
 
 import numpy as np
 import torch
@@ -6,6 +8,7 @@ import torch.fx as fx
 from torch import nn
 
 from compress.heuristics import collect_convolution_layers_to_prune
+from compress.osscar import get_external_nodes
 from compress.osscar_utils import (
     get_coeff_h,
     get_optimal_W,
@@ -17,6 +20,22 @@ from compress.osscar_utils import (
 )
 from model.resnet import resnet50
 
+def clone_subnet(gm):
+    new_graph = torch.fx.Graph()
+    env = {}
+
+    for node in gm.graph.nodes:
+        def safe_lookup(old_node):
+            if old_node in env:
+                return env[old_node]
+            placeholder = new_graph.placeholder(old_node.name)
+            env[old_node] = placeholder
+            return placeholder
+
+        new_node = new_graph.node_copy(node, safe_lookup)
+        env[node] = new_node
+
+    return torch.fx.GraphModule(gm, new_graph)
 
 def get_initial_prefix_submodule(graph_module, end_node):
     """
@@ -47,7 +66,7 @@ def get_initial_prefix_submodule(graph_module, end_node):
     graph = graph_module.graph
     prefix_nodes = []
     prefix_graph = fx.Graph()
-    value_remap = {}
+    env = {}
 
     for node in graph.nodes:
         if node.name == end_node:
@@ -58,19 +77,18 @@ def get_initial_prefix_submodule(graph_module, end_node):
     assert len(prefix_nodes) > 0, "Prefix nodes must not be empty"
 
     for node in prefix_nodes:
-        new_node = prefix_graph.node_copy(node, lambda n: value_remap[n])
-        value_remap[node] = new_node
+        new_node = prefix_graph.node_copy(node, lambda n: env[n] if isinstance(n, fx.Node) else n)
+        env[node] = new_node
 
     last_node = prefix_nodes[-1]
-    prefix_graph.output(value_remap[last_node])
+    prefix_graph.output(env[last_node])
 
     prefix_gm = fx.GraphModule(root=graph_module, graph=prefix_graph)
-    return prefix_gm, value_remap
+    return prefix_gm
 
-
-def get_fx_submodule(graph_module, value_remap, start_node, end_node):
+def get_fx_submodule(gm, start_node, end_node, external_nodes):
     """
-    Extracts a middle subgraph from an FX GraphModule between `start_node` and `end_node`.
+    Extracts a subgraph from an FX GraphModule between `start_node` and `end_node`.
 
     Parameters
     ----------
@@ -99,48 +117,53 @@ def get_fx_submodule(graph_module, value_remap, start_node, end_node):
     - The output of the subgraph is set to the last node before `end_node`.
     - The resulting GraphModule can be called with the input tensors corresponding to the placeholders.
     """
-    assert isinstance(graph_module, fx.GraphModule)
-    assert isinstance(value_remap, dict)
-    assert (
-        len(value_remap) > 0
-    ), "Remap dict cant be empty for slices in the middle of the model"
-    graph = graph_module.graph
-    new_nodes = []
+    assert isinstance(external_nodes, dict), "External nodes must be a dictionary"
+    graph = gm.graph
     new_graph = fx.Graph()
-    keep = False
+    env = {}
+    last_old_node = None
+    external_deps = list(chain.from_iterable(external_nodes.values()))
 
+    def fetch_arg(n):
+        # For non-Node literals
+        if not isinstance(n, fx.Node):
+            return n
+
+        # ALready exists in env
+        if n in env:
+            return env[n]
+
+        # Create a placeholder for an external dependency
+        if n.name in external_deps:
+            ph = new_graph.placeholder(f"external__{n.name}")
+            env[n] = ph
+            return ph
+        
+        raise RuntimeError(f"Missing dependency: {n.name}")
+
+    copying = False
     for node in graph.nodes:
         if node.name == start_node:
-            keep = True
+            copying = True
+
+        if not copying:
+            continue
+
         if node.name == end_node:
             break
-        if keep:
-            new_nodes.append(node)
 
-    assert len(new_nodes) > 0, "Node list must not be empty"
+        new_node = new_graph.node_copy(node, fetch_arg)
+        env[node] = new_node
+        last_old_node = new_node
 
-    # Adds placeholder to the beginning of subgraph so that its forward can take an input
-    first_node = new_nodes[0]
-    for arg in first_node.args:
-        if isinstance(arg, fx.Node):
-            ph = new_graph.placeholder(f"input_{arg.name}")
-            value_remap[arg] = ph
+    # Explicitly adds output node
+    new_graph.output(env[last_old_node])
 
-    for node in new_nodes:
-        new_node = new_graph.node_copy(node, lambda n: value_remap[n])
-        value_remap[node] = new_node
-
-    last_node = new_nodes[-1]
-    new_graph.output(value_remap[last_node])
-
-    new_gm = fx.GraphModule(root=graph_module, graph=new_graph)
-
-    return new_gm, value_remap
+    subnet_gm = fx.GraphModule(gm, new_graph)
+    return subnet_gm
 
 
-def get_suffix_submodule(
-    graph_module: fx.GraphModule, value_remap: dict, start_node: str
-):
+def get_suffix_submodule(gm, start_node, external_nodes):
     """
     Extracts the subgraph from `start_node` (inclusive) to the final output of the model.
 
@@ -148,48 +171,60 @@ def get_suffix_submodule(
     ----------
     graph_module : fx.GraphModule
         The FX-traced full model.
-    value_remap : dict
-        Mapping from previous nodes to their placeholders/substitutes (for start_node input).
     start_node : str
         Name of the node where the suffix begins.
+    external_nodes : dict
+        Dict containing nodes which take inputs that aren't derivable from their own subnet
 
     Returns
     -------
     suffix_gm : fx.GraphModule
         FX GraphModule for the suffix.
-    value_remap : dict
-        Updated mapping including suffix nodes.
     """
-    graph = graph_module.graph
+    assert isinstance(external_nodes, dict), "External nodes must be a dictionary"
+    graph = gm.graph
     new_graph = fx.Graph()
-    new_nodes = []
-    keep = False
+    env = {}
+    last_old_node = None
+    external_deps = list(chain.from_iterable(external_nodes.values()))
 
+    def fetch_arg(n):
+        # For non-Node literals
+        if not isinstance(n, fx.Node):
+            return n
+
+        # ALready exists in env
+        if n in env:
+            return env[n]
+
+        # Create a placeholder for an external dependency
+        if n.name in external_deps:
+            ph = new_graph.placeholder(f"external__{n.name}")
+            env[n] = ph
+            return ph
+        
+        raise RuntimeError(f"Missing dependency: {n.name}")
+
+    copying = False
     for node in graph.nodes:
         if node.name == start_node:
-            keep = True
-        if keep:
-            new_nodes.append(node)
+            copying = True
 
-    assert len(new_nodes) > 0, "Suffix nodes cannot be empty"
+        if not copying:
+            continue
 
-    # Adds placeholder to the beginning of subgraph so that its forward can take an input
-    first_node = new_nodes[0]
-    for arg in first_node.args:
-        if isinstance(arg, fx.Node):
-            ph = new_graph.placeholder(f"input_{arg.name}")
-            value_remap[arg] = ph
+        # if node.name == end_node:
+        #     break
 
-    for node in new_nodes:
-        new_node = new_graph.node_copy(node, lambda n: value_remap[n])
-        value_remap[node] = new_node
+        new_node = new_graph.node_copy(node, fetch_arg)
+        env[node] = new_node
+        last_old_node = new_node
 
-    # Explicitly define output of the subgraph
-    last_node = new_nodes[-1]
-    new_graph.output(value_remap[last_node])
+    # Explicitly adds output node
+    new_graph.output(last_old_node)
 
-    suffix_gm = fx.GraphModule(graph_module, new_graph)
-    return suffix_gm, value_remap
+    suffix_gm = fx.GraphModule(gm, new_graph)
+    return suffix_gm
 
 
 def get_all_subnets(prune_modules_name, graph_module):
@@ -220,36 +255,38 @@ def get_all_subnets(prune_modules_name, graph_module):
     """
     assert isinstance(
         graph_module, fx.GraphModule
-    ), "Graph module must be an instance of fx.GraphModule"
+    ), "graph_module must be an instance of fx.GraphModule"
     assert len(prune_modules_name) > 0, "Prune list must not be empty"
     prune_subnets = []
     dense_subnets = []
-    remap = {}
 
     gm = graph_module
+    external_nodes = get_external_nodes(gm)
+    first_node_name = "_".join(prune_modules_name[0].split("."))
+    prefix_subnet = get_initial_prefix_submodule(
+        graph_module=gm, end_node=first_node_name
+    )
+    prune_subnets.append(prefix_subnet)
+    dense_subnets.append(clone_subnet(prefix_subnet))
 
     for idx, name in enumerate(prune_modules_name):
         fx_name = "_".join(name.split("."))
 
-        if idx == 0:
-            subnet, remap = get_initial_prefix_submodule(
-                graph_module=gm, end_node=fx_name
-            )
-        elif idx == len(prune_modules_name) - 1:
-            subnet, remap = get_suffix_submodule(
-                graph_module=gm, value_remap=remap, start_node=fx_name
+        if idx == len(prune_modules_name) - 1:
+            subnet= get_suffix_submodule(
+                gm=gm, start_node=fx_name, external_nodes=external_nodes
             )
         else:
             end_node = "_".join(prune_modules_name[idx + 1].split("."))
-            subnet, remap = get_fx_submodule(
-                graph_module=gm,
-                value_remap=remap,
+            subnet = get_fx_submodule(
+                gm=gm,
                 start_node=fx_name,
                 end_node=end_node,
+                external_nodes=external_nodes
             )
 
         prune_subnets.append(subnet)
-        dense_subnets.append(subnet)
+        dense_subnets.append(clone_subnet(subnet))
 
     return prune_subnets, dense_subnets
 
@@ -274,8 +311,8 @@ def evaluate_loss(submatrix_w_pruned, dense_weights, subgram_xx, subgram_xy):
     torch.Tensor
         Scalar loss measuring reconstruction error for the pruned channels.
     """
-    A = (submatrix_w_pruned.T @ subgram_xx) @ submatrix_w_pruned
-    B = (dense_weights.T @ subgram_xy) @ dense_weights
+    A = (submatrix_w_pruned.T @ subgram_xx) @ submatrix_w_pruned    
+    B = (dense_weights.T @ subgram_xy) @ submatrix_w_pruned
     return torch.trace(A) - 2 * torch.trace(B)
 
 
@@ -508,15 +545,15 @@ def prune_one_layer(
         gram_xy=total_xty,
     )
 
-    cached_out_pruned = []
-    cached_out_dense = []
+    # cached_out_pruned = []
+    # cached_out_dense = []
 
-    for batch_idx in range(num_batches):
-        cached_out_pruned.append(pruned_subnet(pruned_input[batch_idx]))
-        cached_out_dense.append(dense_subnet(dense_input[batch_idx]))
+    # for batch_idx in range(num_batches):
+    #     cached_out_pruned.append(pruned_subnet(pruned_input[batch_idx]))
+    #     cached_out_dense.append(dense_subnet(dense_input[batch_idx]))
 
-    cached_out_pruned = torch.cat(cached_out_pruned, dim=0)
-    cached_out_dense = torch.cat(cached_out_dense, dim=0)
+    # cached_out_pruned = torch.cat(cached_out_pruned, dim=0)
+    # cached_out_dense = torch.cat(cached_out_dense, dim=0)
 
     new_weight = conv_module.weight[:, keep_mask, :, :]
     if conv_module.bias is not None:
