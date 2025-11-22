@@ -585,12 +585,11 @@ def recompute_H(
 
     kept_indices = []
     numel_one_channel = kernel_height * kernel_width
-    slice_indices = np.arange(activation_in_channels)
+    indices = np.arange(activation_in_channels)
     slice_indices = [
         (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
-        for start in slice_indices
+        for start in indices
     ]
-
     if is_pure_gram:
         for idx, indicator in enumerate(prune_mask):
             if indicator:
@@ -604,10 +603,10 @@ def recompute_H(
     else:
         H_width = H.shape[1]
         mask = np.ones(H_width, dtype=bool)
-        slice_indices = [
-            (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
-            for start in slice_indices
-        ]
+        # slice_indices = [
+        #     (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
+        #     for start in slice_indices
+        # ]
 
         for idx, indicator in enumerate(prune_mask):
             if not indicator:
@@ -804,6 +803,30 @@ def get_optimal_W(gram_xx, gram_xy, dense_weights):
     scaled = VtY / reg_eig_clamped.unsqueeze(-1)
     X = eigvecs @ scaled
     return X
+
+
+def is_real_consumer(node):
+    # Ignores shape-only ops
+    if node.op == "call_method" and node.target in [
+        "size",
+        "__getitem__",
+        "reshape",
+        "view",
+    ]:
+        return False
+    return True
+
+
+# External dependencies needed across subnet boundaries
+def get_external_nodes(gm: torch.fx.GraphModule):
+    external_nodes = {}
+    for node in gm.graph.nodes:
+        real_users = [u for u in node.users if is_real_consumer(u)]
+        if len(real_users) > 1:
+            external_nodes[node.name] = real_users
+
+    return external_nodes
+
 
 
 # def run_submodules_from_start_to_end_layer(
