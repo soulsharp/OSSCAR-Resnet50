@@ -5,12 +5,17 @@ import torch.nn as nn
 import numpy as np
 import torch.fx as fx
 
-from compress.graph_extractor import get_all_subnets, prune_one_layer
+from compress.graph_extractor import get_all_subnets
 from compress.heuristics import collect_convolution_layers_to_prune
-from compress.osscar_utils import get_count_prune_channels
+from compress.osscar_utils import (
+    get_count_prune_channels,
+    is_real_consumer,
+    get_external_nodes,
+    prune_one_layer
+)
 from data.load_data import build_calibration_dataloader, build_eval_dataset
 from model.resnet import resnet50
-from utils.utils import set_global_seed, safe_free
+from utils.utils import set_global_seed, safe_free, load_yaml
 
 
 def run_forward_with_mask(subnet, input, input_mask=None, is_input_loader=False):
@@ -19,7 +24,7 @@ def run_forward_with_mask(subnet, input, input_mask=None, is_input_loader=False)
 
     Supports either a preloaded tensor of shape (num_batches, batch_size, C, H, W)
     or a DataLoader. The outputs from all batches are stacked along a new leading
-    dimension for later calibration or analysis.
+    dimension for forming gram matrices.
 
     Args:
         subnet (nn.Module): The model or subnet to evaluate.
@@ -51,8 +56,8 @@ def run_forward_with_mask(subnet, input, input_mask=None, is_input_loader=False)
         # Note to self: could include all elements in 1 batch effectively making the input_tensor 4D
         # The for loop can then be avoided but might make the solution too memory-intensive
         for i in range(num_batches):
-            input_tensor = input_tensor[i, :, :, :, :]
-            output_tensor = subnet(input_tensor)
+            current_batch = input_tensor[i, :, :, :, :]
+            output_tensor = subnet(current_batch)
             calibration_batches.append(output_tensor)
     cached_input = torch.stack(calibration_batches, dim=0)
 
@@ -91,10 +96,11 @@ def run_osscar(model, calibration_loader, args):
     channels_post_prune, prune_channels_by_layer, remaining_params = (
         get_count_prune_channels(model=model, prune_percentage=prune_percentage)
     )
+    # print(prune_channels_by_layer)
     _, prune_modules_name = collect_convolution_layers_to_prune(model=model)
+    # print(prune_modules_name)
 
     gm = fx.symbolic_trace(model)
-
     prune_subnets, dense_subnets = get_all_subnets(
         graph_module=gm, prune_modules_name=prune_modules_name
     )
@@ -113,13 +119,14 @@ def run_osscar(model, calibration_loader, args):
     ).detach()
     cached_input = dense_cached_input
 
+    # Bug: This code shouldn't execute when layer_prune_channels = 0
     for i in range(1, len(dense_subnets)):
         subnet_post_pruning, keep_mask = prune_one_layer(
             dense_subnet=dense_subnets[i],
             pruned_subnet=prune_subnets[i],
             dense_input=dense_cached_input,
             pruned_input=cached_input,
-            layer_prune_channels=prune_channels_by_layer[i],
+            layer_prune_channels=int(prune_channels_by_layer[i - 1]),
         )
 
         pruned_model.append(subnet_post_pruning)
@@ -128,7 +135,7 @@ def run_osscar(model, calibration_loader, args):
             subnet=dense_subnets[i], input=dense_cached_input, input_mask=None
         ).detach()
         new_pruned = run_forward_with_mask(
-            subnet=prune_subnets[i], input=cached_input, input_mask=keep_mask
+            subnet=subnet_post_pruning, input=cached_input, input_mask=keep_mask
         ).detach()
 
         safe_free(dense_cached_input, cached_input)
@@ -168,12 +175,23 @@ if __name__ == "__main__":
     g = torch.Generator()
     g.manual_seed(11)
 
-    calibration_dataset = build_eval_dataset(cfg="config/config.yaml")
+    cfg_path = "config/config.yaml"
+    cfg = load_yaml(cfg_path)
+    assert cfg is not None, "Config cannot be empty or None"
+    calibration_dataset = build_eval_dataset(cfg=cfg["eval"])
     calibration_dataloader = build_calibration_dataloader(
         dataset=calibration_dataset, num_samples=500, g=g, batch_size=32
     )
 
     model = resnet50(pretrained=True)
+    # activation_in_channels = 3
+    # numel_one_channel = 9
+    # slice_indices = np.arange(activation_in_channels)
+    # slice_indices = [
+    #     (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
+    #     for start in slice_indices
+    # ]
+    # print(slice_indices)
     parser = argparse.ArgumentParser(description="Arguments for OSSCAR")
     parser.add_argument("--prune_percentage", default=0.25, type=float)
     args = parser.parse_args()

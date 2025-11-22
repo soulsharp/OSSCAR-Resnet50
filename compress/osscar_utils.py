@@ -1,5 +1,5 @@
 import random
-from typing import cast
+from typing import cast, Optional
 
 import numpy as np
 import torch
@@ -143,36 +143,6 @@ def get_XtY(X, Y):
 
     assert A.shape[1] == Y.shape[0]
     return A @ Y
-
-
-# def compute_layer_loss(dense_weights, pruned_weights, input):
-#     """
-#     Compute the layer reconstruction loss using H and G coefficients.
-
-#     Parameters
-#     ----------
-#     dense_weights : torch.Tensor
-#         Original (dense) layer weights reshaped to 2D.
-#     pruned_weights : torch.Tensor
-#         Pruned layer weights reshaped to 2D.
-#     input : torch.Tensor
-#         Layer input activations before non-linearity.
-#         Shape (B, C, H, W) or (C, H, W).
-
-#     Returns
-#     -------
-#     torch.Tensor
-#         Scalar loss measuring how well the pruned layer reconstructs the original.
-#     """
-#     G = get_coeff_g(dense_layer_weights=dense_weights, layer_input=input)
-#     H = get_coeff_h(design_matrix=input)
-#     A = (pruned_weights.T @ H) @ pruned_weights
-#     B = G.T @ pruned_weights
-
-#     assert A.ndim == B.ndim == 2, "Trace can be computed only for 2D matrices"
-#     loss = 0.5 * torch.trace(A) + torch.trace(B)
-
-#     return loss
 
 
 def num_params_in_prune_channels(layers):
@@ -450,47 +420,6 @@ def register_hooks_to_collect_outs(prune_modules, prune_module_names, hook_fn):
     return gram_activations
 
 
-# def accumulate_xtx_statistics(model, calibration_dataloader):
-#     """
-#     Run the model over the calibration data to accumulate per-layer
-#     XᵀX (Gram) matrices using registered forward hooks.
-#     """
-#     for images, _ in calibration_dataloader:
-#         model(images)
-
-# def get_kept_indices(prune_mask, kernel_height, kernel_width):
-#     """
-#     Compute row indices corresponding to channels to keep.
-
-#     Parameters
-#     ----------
-#     prune_mask : array-like of bool
-#         Boolean mask of length `Cin`. True = keep, False = prune.
-#     kernel_height : int
-#         Conv kernel height.
-#     kernel_width : int
-#         Conv kernel width.
-
-#     Returns
-#     -------
-#     np.ndarray
-#         1D array of row indices corresponding to the kept channels.
-#     """
-#     prune_mask = np.asarray(prune_mask)
-#     assert prune_mask.ndim == 1, "prune_mask must be 1D"
-#     Cin = len(prune_mask)
-#     numel_one_channel = kernel_height * kernel_width
-
-#     kept_indices = []
-#     for idx, keep in enumerate(prune_mask):
-#         if keep:
-#             start = idx * numel_one_channel
-#             stop = start + numel_one_channel
-#             kept_indices.extend(range(start, stop))
-
-#     return np.array(kept_indices)
-
-
 def recompute_X(prune_mask, X, activation_in_channels, kernel_height, kernel_width):
     """
     Recompute the unfolded input matrix X after pruning input channels.
@@ -536,19 +465,6 @@ def recompute_X(prune_mask, X, activation_in_channels, kernel_height, kernel_wid
             mask[start:stop] = False
 
     return X[:, mask]
-
-
-# def recompute_X(prune_mask, X, kernel_height, kernel_width):
-#     kept_idx = get_kept_indices(prune_mask, kernel_height, kernel_width)
-#     return X[:, kept_idx]
-
-# def recompute_W(prune_mask, W, kernel_height, kernel_width):
-#     kept_idx = get_kept_indices(prune_mask, kernel_height, kernel_width)
-#     return W[kept_idx, :]
-
-# def recompute_H(prune_mask, H, kernel_height, kernel_width):
-#     kept_idx = get_kept_indices(prune_mask, kernel_height, kernel_width)
-#     return H[np.ix_(kept_idx, kept_idx)]
 
 
 def recompute_H(
@@ -805,6 +721,310 @@ def get_optimal_W(gram_xx, gram_xy, dense_weights):
     return X
 
 
+def evaluate_loss(submatrix_w_pruned, dense_weights, subgram_xx, subgram_xy):
+    """
+    Compute the OSSCAR-style loss for a candidate pruned set of channels.
+
+    Parameters
+    ----------
+    submatrix_w_pruned : torch.Tensor
+        Weight matrix corresponding to the pruned channels.
+    dense_weights : torch.Tensor
+        Original dense weight matrix of the layer.
+    subgram_xx : torch.Tensor
+        Gram matrix of pruned activations (X^T X for pruned channels).
+    subgram_xy : torch.Tensor
+        Cross Gram matrix between pruned activations and dense outputs (X^T Y).
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss measuring reconstruction error for the pruned channels.
+    """
+    A = (submatrix_w_pruned.T @ subgram_xx) @ submatrix_w_pruned
+    B = (dense_weights.T @ subgram_xy) @ submatrix_w_pruned
+    return torch.trace(A) - 2 * torch.trace(B)
+
+
+def get_parent_module(model, target_module):
+    """Find the direct parent and name of a given submodule.
+
+    Iterates through all modules in `model` to locate the one that directly contains
+    `target_module`.
+
+    Args:
+        model (nn.Module): Root model to search.
+        target_module (nn.Module): Submodule to locate.
+
+    Returns:
+        (nn.Module, str): Parent module and the submodule's attribute name.
+
+    Raises:
+        ValueError: If the target module isn’t found.
+    """
+    for _, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if child is target_module:
+                return module, child_name
+    raise ValueError("Target module not found")
+
+
+def replace_module(model, target_module, new_module):
+    """Replace a submodule in-place within a model.
+
+    Finds the parent of `target_module` using `get_parent_module` and swaps it with
+    `new_module` via `setattr`.
+
+    Args:
+        model (nn.Module): Root model.
+        target_module (nn.Module): Module to replace.
+        new_module (nn.Module): Replacement module.
+    """
+    parent, name = get_parent_module(model, target_module)
+    setattr(parent, name, new_module)
+
+def perform_local_search(
+    dense_weights,
+    layer,
+    p,
+    gram_xx,
+    gram_xy,
+    prune_by_iter: Optional[list] = None,
+    sym_diff_per_iter: Optional[list] = None,
+    prune_per_iter=2,
+):
+    """
+    Greedy local search to select which input channels to prune in a Conv2d layer.
+
+    Iteratively evaluates the importance of each input channel using Gram matrices
+    (X^T X and X^T Y) and prunes the least important channels according to the
+    specified schedule.
+
+    Args:
+        dense_weights (torch.Tensor): Original dense weight matrix of the layer.
+        layer (nn.Conv2d): Convolutional layer to prune.
+        p (int): Total number of channels to prune.
+        gram_xx (torch.Tensor): Full Gram matrix of layer inputs (X^T X).
+        gram_xy (torch.Tensor): Cross Gram matrix between layer inputs and outputs (X^T Y).
+        prune_by_iter (list, optional): Custom pruning schedule per iteration.
+        sym_diff_per_iter (list, optional): Symmetric difference allowed per iteration.
+        prune_per_iter (int, default=2): Number of channels to prune per iteration
+            (ignored if `prune_by_iter` is provided).
+
+    Returns:
+        keep_mask (torch.BoolTensor): Boolean mask of channels to keep (`True`) or prune (`False`).
+        kept_channels (set): Indices of channels retained after pruning.
+        removed_channels (set): Indices of channels removed during pruning.
+    """
+    assert isinstance(layer, nn.Conv2d)
+    assert isinstance(p, int) and p > 0
+
+    # Determine pruning schedule
+    if prune_by_iter is None:
+        prune_list = []
+        num_iterations = p // prune_per_iter
+        rem = p % prune_per_iter
+        if p >= prune_per_iter:
+            prune_list.extend([prune_per_iter for _ in range(num_iterations)])
+        if rem > 0:
+            prune_list.append(rem)
+    else:
+        assert np.sum(np.array(prune_by_iter)) == p
+        prune_list = prune_by_iter
+
+    if sym_diff_per_iter is not None:
+        assert len(prune_list) == len(sym_diff_per_iter)
+        assert all(p <= t for p, t in zip(prune_list, sym_diff_per_iter))
+    else:
+        sym_diff_per_iter = prune_list
+
+    kept_channels = set(range(layer.in_channels))
+    removed_channels = set()
+    total_channels = kept_channels.copy()
+    keep_mask = torch.ones(layer.in_channels, dtype=torch.bool)
+
+    # Iterative greedy pruning, where t=p and hence s1 = 0
+    for i in range(len(prune_list)):
+        num_prune_iter = prune_list[i]
+        sym_diff_iter = sym_diff_per_iter[i]
+        s1 = (sym_diff_iter - num_prune_iter) // 2
+        s2 = (sym_diff_iter + num_prune_iter) // 2
+
+        assert kept_channels.union(removed_channels) == total_channels
+
+        channel_importance_dict = {}
+
+        # Evaluate loss increase if each kept channel were pruned
+        for channel in kept_channels:
+            temp_keep_mask = keep_mask.clone()
+            temp_keep_mask[channel] = False
+
+            subgram_xx = recompute_H(
+                prune_mask=temp_keep_mask,
+                H=gram_xx,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+                activation_in_channels=layer.in_channels,
+                is_pure_gram=True,
+            )
+            subgram_xy = recompute_H(
+                prune_mask=temp_keep_mask,
+                H=gram_xy,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+                activation_in_channels=layer.in_channels,
+                is_pure_gram=False,
+            )
+            # sub_w_optimal = recompute_W(
+            #     prune_mask=temp_keep_mask,
+            #     W=w_optimal,
+            #     activation_in_channels=layer.in_channels,
+            #     kernel_height=layer.kernel_size[0],
+            #     kernel_width=layer.kernel_size[1],
+            # )
+            submatrix_w_pruned = recompute_W(
+                prune_mask=temp_keep_mask,
+                W=dense_weights,
+                activation_in_channels=layer.in_channels,
+                kernel_height=layer.kernel_size[0],
+                kernel_width=layer.kernel_size[1],
+            )
+
+            loss = evaluate_loss(
+                submatrix_w_pruned, dense_weights, subgram_xx, subgram_xy
+            )
+            channel_importance_dict[channel] = loss.item()
+
+        # Sort channels by importance(ascending = least important first)
+        sorted_channels = [
+            k
+            for k, _ in sorted(
+                channel_importance_dict.items(), key=lambda item: item[1]
+            )
+        ]
+
+        # Prune s2 least important channels
+        to_prune = sorted_channels[:s2]
+        for channel in to_prune:
+            keep_mask[channel] = False
+            kept_channels.remove(channel)
+            removed_channels.add(channel)
+
+        print(
+            f"Iteration {i+1}: pruned {len(to_prune)} channels, {len(kept_channels)} remaining."
+        )
+
+    return keep_mask, kept_channels, removed_channels
+
+
+def prune_one_layer(
+    dense_subnet, pruned_subnet, dense_input, pruned_input, layer_prune_channels
+):
+    """
+    Prune a single Conv2d layer from a subnet and replace it with a smaller version.
+
+    Uses Gram matrices of the layer inputs and outputs to evaluate channel importance
+    and greedily prune the least important input channels. Replaces the original
+    layer in `pruned_subnet` with a new Conv2d containing only the kept channels.
+
+    Args:
+        dense_subnet (nn.Module): Full, unpruned reference subnet.
+        pruned_subnet (nn.Module): Subnet to be pruned and modified.
+        dense_input (Tensor): Dense model inputs of shape (num_batches, batch_size, C, H, W).
+        pruned_input (Tensor): Pruned model inputs of the same shape.
+        layer_prune_channels (int): Number of channels to prune in this layer.
+
+    Returns:
+        pruned_subnet (nn.Module): Updated subnet with the pruned layer replaced.
+        keep_mask (torch.BoolTensor): Boolean mask indicating which channels were kept.
+    """
+    assert (
+        dense_input.ndim == 5 and pruned_input.ndim == 5
+    ), "Inputs must be (num_batches, batch_size, C, H, W)"
+
+    num_batches, batch_size, C, H, W = dense_input.shape
+    N = num_batches * batch_size
+
+    # Get conv module to prune
+    conv_module = next(
+        m for _, m in pruned_subnet.named_modules() if isinstance(m, nn.Conv2d)
+    )
+    reshaped_conv_wt = reshape_filter(conv_module.weight)
+
+    # Flatten all images into one dimension and reshape for gram_matrices calculation
+    dense_input_flat = dense_input.reshape(N, C, H, W)
+    pruned_input_flat = pruned_input.reshape(N, C, H, W)
+    dense_X = reshape_conv_layer_input(dense_input_flat, conv_module)
+    pruned_X = reshape_conv_layer_input(pruned_input_flat, conv_module)
+
+    # Compute gram matrices over all N images
+    total_xtx = get_coeff_h(pruned_X) / N
+    total_xty = get_XtY(pruned_X, dense_X) / N
+
+    # # Optimal weights
+    # w_optimal = get_optimal_W(
+    #     gram_xx=total_xtx, gram_xy=total_xty, dense_weights=reshaped_conv_wt
+    # )
+
+    keep_mask, kept_channels, removed_channels = perform_local_search(
+        dense_weights=reshaped_conv_wt,
+        layer=conv_module,
+        p=layer_prune_channels,
+        gram_xx=total_xtx,
+        gram_xy=total_xty,
+    )
+
+    # cached_out_pruned = []
+    # cached_out_dense = []
+
+    # for batch_idx in range(num_batches):
+    #     cached_out_pruned.append(pruned_subnet(pruned_input[batch_idx]))
+    #     cached_out_dense.append(dense_subnet(dense_input[batch_idx]))
+
+    # cached_out_pruned = torch.cat(cached_out_pruned, dim=0)
+    # cached_out_dense = torch.cat(cached_out_dense, dim=0)
+
+    new_weight = conv_module.weight[:, keep_mask, :, :]
+    if conv_module.bias is not None:
+        new_bias = conv_module.bias
+    else:
+        new_bias = None
+
+    kernel_size = conv_module.kernel_size
+    stride = conv_module.stride
+    padding = conv_module.padding
+    dilation = conv_module.dilation
+
+    # Pylance fix
+    kernel_size_2 = (kernel_size[0], kernel_size[1])
+    stride_2 = (stride[0], stride[1])
+    padding_2 = (padding[0], padding[1])
+    dilation_2 = (dilation[0], dilation[1])
+
+    # Replacement module
+    new_conv_module = nn.Conv2d(
+        in_channels=conv_module.in_channels,
+        out_channels=conv_module.out_channels - 1,
+        kernel_size=kernel_size_2,
+        stride=stride_2,
+        padding=padding_2,
+        dilation=dilation_2,
+        groups=conv_module.groups,
+        bias=conv_module.bias is not None,
+    )
+
+    # Replace weights
+    new_conv_module.weight.data = new_weight.clone()
+    if new_bias is not None:
+        new_conv_module.bias.data = new_bias.clone()
+
+    replace_module(
+        model=pruned_subnet, target_module=conv_module, new_module=new_conv_module
+    )
+
+    return pruned_subnet, keep_mask
+
+
 def is_real_consumer(node):
     # Ignores shape-only ops
     if node.op == "call_method" and node.target in [
@@ -826,87 +1046,3 @@ def get_external_nodes(gm: torch.fx.GraphModule):
             external_nodes[node.name] = real_users
 
     return external_nodes
-
-
-
-# def run_submodules_from_start_to_end_layer(
-#     start_layer_name, end_layer_name, model, input
-# ):
-#     assert isinstance(model, nn.Module)
-#     x = input
-#     fwd_flag = False
-#     for name, module in model.named_modules():
-#         if name == start_layer_name:
-#             fwd_flag = True
-
-#         if fwd_flag and name == end_layer_name:
-#             return x
-#         elif fwd_flag:
-#             x = module(x)
-
-
-if __name__ == "__main__":
-    # rand_filter = torch.randn((8, 3, 3, 3))
-    # reshaped = reshape_filter(rand_filter)
-    # print(reshaped.size())
-    # unfold = nn.Unfold(
-    #             kernel_size=3,
-    #             dilation=1,
-    #             padding=1,
-    #             stride=1
-    # )
-    # inp = unfold(rand_filter)
-    # inp = inp.permute([1, 0, 2])
-    # inp = inp.flatten(1)
-
-    # # print(inp.shape)
-    model = resnet50(pretrained=True)
-    # overall_prune_percentage = 0.3
-    # # _, p, rem_params = get_count_prune_channels(
-    # #     model=model, prune_percentage=overall_prune_percentage
-    # # )
-
-    # # print(f"P: {p}")
-    # # print(f"Rem parameters to prune: {rem_params}")
-    # activation_in_channels = 3
-    # numel_one_channel = 9
-    # slice_indices = np.arange(activation_in_channels, dtype=np.int32)
-    # slice_indices = [(start * numel_one_channel, start * numel_one_channel + numel_one_channel - 1) for start in slice_indices]
-    # print(slice_indices)
-
-    # z = np.random.randint(low=0, high=2, size=activation_in_channels)
-    # print("Z:", z)
-    # W = np.random.randn(27, 1)
-    # print("W before: ", W)
-    # print("W after: ", get_matrix_I(z, W, activation_in_channels, 3, 3))
-
-    # layer_input = torch.randn((3, 3, 4))
-    # output = get_coeff_h(layer_input)
-    # print(output.shape)
-
-    # input_activation = torch.randn(2, 3, 32, 32)
-    # pruned_activation = torch.randn(2, 2, 32, 32)
-    # mini_conv = nn.Conv2d(padding=1, kernel_size=3, in_channels=3, out_channels=8)
-
-    # out = reshape_conv_layer_input(input_activation, mini_conv)
-
-    # W = reshape_filter(mini_conv.weight)
-    # print(f"Reshaped W before pruning: {W.shape}")
-
-    # prune_mask = [1, 1, 0]
-    # W_pruned = recompute_W(prune_mask, W, activation_in_channels=3, kernel_height=3, kernel_width=3)
-
-    # print(f"Reshaped W after pruning: {W_pruned.shape}")
-
-    # print("Reshaped activation shape before pruning:", out.shape)
-
-    # X = recompute_X(prune_mask=prune_mask, X=out, activation_in_channels=3, kernel_height=3, kernel_width=3)
-
-    # print("Reshaped activation shape after pruning:", X.shape)
-
-    # corr = get_XtY(out, X)
-    # print("XtY shape", corr.shape)
-
-    # print(get_coeff_h(out).shape)
-
-    # print(model.named_children)
