@@ -879,13 +879,7 @@ def perform_local_search(
                 activation_in_channels=layer.in_channels,
                 is_pure_gram=False,
             )
-            # sub_w_optimal = recompute_W(
-            #     prune_mask=temp_keep_mask,
-            #     W=w_optimal,
-            #     activation_in_channels=layer.in_channels,
-            #     kernel_height=layer.kernel_size[0],
-            #     kernel_width=layer.kernel_size[1],
-            # )
+
             submatrix_w_pruned = recompute_W(
                 prune_mask=temp_keep_mask,
                 W=dense_weights,
@@ -948,10 +942,6 @@ def prune_one_layer(
 
     num_batches, batch_size, C, H, W = dense_input.shape
     N = num_batches * batch_size
-
-    # Get conv module to prune
-    # Debugging note : Is the first named_module guaranteed to be a nn.Conv2d
-    # even after the changes involving the placeholders?
     conv_module = next(
         m for _, m in pruned_subnet.named_modules() if isinstance(m, nn.Conv2d)
     )
@@ -1043,13 +1033,6 @@ class DenseSubnetRunner(nn.Module):
                 else:
                     inputs[node_name] = x
 
-        # for k, t in inputs.items():
-        #     if isinstance(t, torch.Tensor):
-        #         print(f"Debse Runner input {k}: ndim={t.ndim}, shape={t.shape}")
-        #     else:
-        #         print(f"Dense Runner input {k}: type={type(t)} (BAD)")
-
-        # print("Input keys : ", inputs.keys())
         out = self.gm(**inputs)
 
         if isinstance(out, dict):

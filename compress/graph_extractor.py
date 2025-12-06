@@ -347,4 +347,3 @@ def display_subnet_info(subnet: fx.GraphModule):
         print("Node_op:", node.op)
         print("Node_args: ", node.args)
         print("Node_kwargs: ", node.kwargs)
-
