@@ -2,46 +2,66 @@ import argparse
 
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.fx as fx
 
 from compress.graph_extractor import get_all_subnets
 from compress.heuristics import collect_convolution_layers_to_prune
 from compress.osscar_utils import (
     get_count_prune_channels,
+    SubnetRunner,
+    DenseSubnetRunner,
     is_real_consumer,
     get_external_nodes,
-    prune_one_layer
+    prune_one_layer,
 )
 from data.load_data import build_calibration_dataloader, build_eval_dataset
 from model.resnet import resnet50
 from utils.utils import set_global_seed, safe_free, load_yaml
 
 
-def run_forward_with_mask(subnet, input, input_mask=None, is_input_loader=False):
+def run_forward_with_mask(
+    subnet,
+    input,
+    input_mask=None,
+    is_input_loader=False,
+    external_nodes=None,
+    ctx=None,
+    prune_channel_name=None,
+):
     """
-    Runs forward passes through a subnet, optionally masking input channels.
-
-    Supports either a preloaded tensor of shape (num_batches, batch_size, C, H, W)
-    or a DataLoader. The outputs from all batches are stacked along a new leading
-    dimension for forming gram matrices.
+    Run a subnet forward pass over batched inputs (tensor or DataLoader), optionally
+    masking input channels. Uses SubnetRunner so external dependencies are pulled
+    from `ctx`, which is updated with new intermediate outputs.
 
     Args:
-        subnet (nn.Module): The model or subnet to evaluate.
-        input (torch.Tensor | DataLoader): Batched tensor input or a DataLoader.
-        input_mask (torch.BoolTensor, optional): Channel-wise boolean mask; only
-            channels with `True` are retained.
-        is_input_loader (bool, default=False): If True, treats `input` as a DataLoader.
+        subnet (fx.GraphModule): Subnet to execute.
+        input (Tensor | DataLoader): 5D tensor (num_batches, B, C, H, W) or loader.
+        input_mask (BoolTensor, optional): Channel mask.
+        is_input_loader (bool): Whether `input` is a DataLoader.
+        external_nodes (dict): External dependency mapping.
+        ctx (dict): Context shared across subnets.
 
     Returns:
-        cached_input (torch.Tensor): Stacked outputs for all batches, of shape
-            (num_batches, batch_size, C_out, H_out, W_out).
+        cached_input (Tensor): Stacked per-batch outputs.
+        ctx (dict): Updated context.
     """
+    assert external_nodes is not None, "external_nodes must exist even as an empty dict"
+    assert ctx is not None, "Context dictionary cannot be None"
     calibration_batches = []
+    if input_mask is None:
+        subnet_runner = DenseSubnetRunner(
+            subnet_gm=subnet, external_nodes=external_nodes
+        )
+    else:
+        subnet_runner = SubnetRunner(
+            subnet_gm=subnet,
+            external_nodes=external_nodes,
+            pruned_conv_target=prune_channel_name,
+        )
     if is_input_loader:
         assert isinstance(input, torch.utils.data.DataLoader)
         for images, _ in input:
-            outs = subnet(images)
+            outs, ctx = subnet_runner(images, ctx)
             calibration_batches.append(outs)
     else:
         assert isinstance(input, torch.Tensor)
@@ -49,60 +69,73 @@ def run_forward_with_mask(subnet, input, input_mask=None, is_input_loader=False)
         num_batches = input.shape[0]
 
         if input_mask is not None:
-            input_tensor = input[:, :, input_mask, :, :]
+            masked_input = input[:, :, input_mask, :, :]
+            keep_mask = input_mask
+            for i in range(num_batches):
+                current_batch = masked_input[i, :, :, :, :]
+                output_tensor, ctx = subnet_runner(
+                    x=current_batch, ctx=ctx, keep_mask=keep_mask, batch_idx=i
+                )
+                calibration_batches.append(output_tensor)
         else:
-            input_tensor = input
+            masked_input = input
+            for i in range(num_batches):
+                current_batch = masked_input[i, :, :, :, :]
+                output_tensor, ctx = subnet_runner(
+                    x=current_batch, ctx=ctx, batch_idx=i
+                )
+                calibration_batches.append(output_tensor)
 
-        # Note to self: could include all elements in 1 batch effectively making the input_tensor 4D
-        # The for loop can then be avoided but might make the solution too memory-intensive
-        for i in range(num_batches):
-            current_batch = input_tensor[i, :, :, :, :]
-            output_tensor = subnet(current_batch)
-            calibration_batches.append(output_tensor)
     cached_input = torch.stack(calibration_batches, dim=0)
+    for k, v in ctx.items():
+        if isinstance(v, list):
+            ctx[k] = torch.stack(v, dim=0)
 
-    return cached_input
+    return cached_input, ctx
+
+
+def transform_prune_name(name):
+    name = name.split(".")
+    return "_".join(name)
 
 
 def run_osscar(model, calibration_loader, args):
     """
-    Apply OSSCAR-style structured pruning to a model using a calibration dataset.
+    Run OSSCAR-style structured channel pruning on a model using a calibration set.
 
-    The function:
-      1. Determines how many channels to prune per layer based on `args.prune_percentage`.
-      2. Identifies convolution layers eligible for pruning.
-      3. Symbolically traces the model to extract subnets for pruning.
-      4. Iteratively prunes layers using local greedy search while caching intermediate activations.
-      5. Returns a list of pruned subnets forming the pruned model and the per-layer keep masks.
+    The procedure:
+      1. Compute how many channels to prune per Conv layer.
+      2. Symbolically trace the model and split it into prefix/middle/suffix subnets.
+      3. Run each subnet on calibration data to cache activations.
+      4. Iteratively prune layers using a local greedy search.
+      5. Recompute cached inputs after each pruning step.
 
-    Parameters
-    ----------
-    model : nn.Module
-        The original dense PyTorch model to prune.
-    calibration_loader : torch.utils.data.DataLoader
-        Data loader providing batches for calibration / activation caching.
-    args : Namespace
-        Arguments containing `prune_percentage` among other potential config values.
+    Args:
+        model (nn.Module): Dense model to prune.
+        calibration_loader (DataLoader): Data for activation calibration.
+        args (Namespace): Must contain `prune_percentage`.
 
-    Returns
-    -------
-    pruned_model : list[nn.Module]
-        List of subnets forming the pruned model.
-    keep_masks : list[torch.BoolTensor]
-        Per-layer boolean masks indicating which input channels were kept.
+    Returns:
+        pruned_model (list[nn.Module]): Ordered list of pruned subnets.
+        keep_masks (list[BoolTensor]): Per-layer channel masks indicating which
+            input channels were kept after pruning.
     """
-
     prune_percentage = args.prune_percentage
-    channels_post_prune, prune_channels_by_layer, remaining_params = (
-        get_count_prune_channels(model=model, prune_percentage=prune_percentage)
+    _, prune_channels_by_layer, _ = get_count_prune_channels(
+        model=model, prune_percentage=prune_percentage
     )
+    # if "conv1" in prune_channels_by_layer:
+    #     prune_channels_by_layer.remove("conv1")
     # print(prune_channels_by_layer)
     _, prune_modules_name = collect_convolution_layers_to_prune(model=model)
-    # print(prune_modules_name)
+    # if "conv1" in prune_modules_name:
+    #     prune_modules_name.remove("conv1")
+    # print("Channels to  prune : ", prune_modules_name)
 
     gm = fx.symbolic_trace(model)
+    external_nodes = get_external_nodes(gm)
     prune_subnets, dense_subnets = get_all_subnets(
-        graph_module=gm, prune_modules_name=prune_modules_name
+        gm=gm, prune_modules_name=prune_modules_name, external_nodes=external_nodes
     )
     assert len(prune_subnets) == len(dense_subnets)
 
@@ -110,16 +143,19 @@ def run_osscar(model, calibration_loader, args):
     pruned_model = []
     prefix_subnet = prune_subnets[0]
     pruned_model.append(prefix_subnet)
+    ctx = {}
+    dense_ctx = {}
 
-    dense_cached_input = run_forward_with_mask(
+    dense_cached_input, dense_ctx = run_forward_with_mask(
         subnet=prefix_subnet,
         input=calibration_loader,
         input_mask=None,
         is_input_loader=True,
-    ).detach()
-    cached_input = dense_cached_input
+        external_nodes=external_nodes,
+        ctx=dense_ctx,
+    )
+    cached_input = dense_cached_input.detach()
 
-    # Bug: This code shouldn't execute when layer_prune_channels = 0
     for i in range(1, len(dense_subnets)):
         subnet_post_pruning, keep_mask = prune_one_layer(
             dense_subnet=dense_subnets[i],
@@ -128,18 +164,43 @@ def run_osscar(model, calibration_loader, args):
             pruned_input=cached_input,
             layer_prune_channels=int(prune_channels_by_layer[i - 1]),
         )
+        prune_channel_name = prune_modules_name[i - 1]
+        prune_channel_name = transform_prune_name(prune_channel_name)
+        print(f"Prune_channel_name = {prune_channel_name}")
+        from compress.graph_extractor import display_subnet_info
 
+        display_subnet_info(subnet_post_pruning)
+        print(f"Keep mask after iter {i} : {keep_mask.sum()}")
+        print(f"Shape of input to the dense forward : {dense_cached_input.shape}")
         pruned_model.append(subnet_post_pruning)
         keep_masks.append(keep_mask)
-        new_dense = run_forward_with_mask(
-            subnet=dense_subnets[i], input=dense_cached_input, input_mask=None
-        ).detach()
-        new_pruned = run_forward_with_mask(
-            subnet=subnet_post_pruning, input=cached_input, input_mask=keep_mask
-        ).detach()
+        new_dense, dense_ctx = run_forward_with_mask(
+            subnet=dense_subnets[i],
+            input=dense_cached_input,
+            input_mask=None,
+            external_nodes=external_nodes,
+            ctx=dense_ctx,
+        )
+        print(f"Shape of dense_cached_input after iter {i} : {new_dense.shape}")
+        ctx_vals = [(k, v.shape) for k, v in ctx.items()]
+        print(f"Ctx vals shape after iter {i}: {ctx_vals}")
+        print(f"Shape of input to prune forward : {cached_input.shape}")
+
+        new_pruned, ctx = run_forward_with_mask(
+            subnet=subnet_post_pruning,
+            input=cached_input,
+            input_mask=keep_mask,
+            external_nodes=external_nodes,
+            ctx=ctx,
+            prune_channel_name=prune_channel_name,
+        )
+        print(
+            f"Shape of cached_input after prune forward {i} times : {new_pruned.shape}"
+        )
+        print(f"Ctx after running prune forward {i} times : {ctx.keys()}")
 
         safe_free(dense_cached_input, cached_input)
-        dense_cached_input, cached_input = new_dense, new_pruned
+        dense_cached_input, cached_input = new_dense.detach(), new_pruned.detach()
 
     return pruned_model, keep_masks
 
@@ -184,14 +245,6 @@ if __name__ == "__main__":
     )
 
     model = resnet50(pretrained=True)
-    # activation_in_channels = 3
-    # numel_one_channel = 9
-    # slice_indices = np.arange(activation_in_channels)
-    # slice_indices = [
-    #     (start * numel_one_channel, start * numel_one_channel + numel_one_channel)
-    #     for start in slice_indices
-    # ]
-    # print(slice_indices)
     parser = argparse.ArgumentParser(description="Arguments for OSSCAR")
     parser.add_argument("--prune_percentage", default=0.25, type=float)
     args = parser.parse_args()
