@@ -211,3 +211,4 @@ __marimo__/
 /profiler/trace.json
 /logs/profiler
 /.vscode
+/.VSCodeCounter

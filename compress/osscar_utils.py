@@ -1,5 +1,6 @@
 import random
 from typing import cast, Optional
+from itertools import chain
 
 import numpy as np
 import torch
@@ -760,7 +761,7 @@ def get_parent_module(model, target_module):
         (nn.Module, str): Parent module and the submodule's attribute name.
 
     Raises:
-        ValueError: If the target module isn’t found.
+        ValueError: If the target module isn't found.
     """
     for _, module in model.named_modules():
         for child_name, child in module.named_children():
@@ -782,6 +783,7 @@ def replace_module(model, target_module, new_module):
     """
     parent, name = get_parent_module(model, target_module)
     setattr(parent, name, new_module)
+
 
 def perform_local_search(
     dense_weights,
@@ -843,6 +845,8 @@ def perform_local_search(
     total_channels = kept_channels.copy()
     keep_mask = torch.ones(layer.in_channels, dtype=torch.bool)
 
+    print(f"Pruning layer : {layer._get_name}...")
+
     # Iterative greedy pruning, where t=p and hence s1 = 0
     for i in range(len(prune_list)):
         num_prune_iter = prune_list[i]
@@ -875,13 +879,7 @@ def perform_local_search(
                 activation_in_channels=layer.in_channels,
                 is_pure_gram=False,
             )
-            # sub_w_optimal = recompute_W(
-            #     prune_mask=temp_keep_mask,
-            #     W=w_optimal,
-            #     activation_in_channels=layer.in_channels,
-            #     kernel_height=layer.kernel_size[0],
-            #     kernel_width=layer.kernel_size[1],
-            # )
+
             submatrix_w_pruned = recompute_W(
                 prune_mask=temp_keep_mask,
                 W=dense_weights,
@@ -944,8 +942,6 @@ def prune_one_layer(
 
     num_batches, batch_size, C, H, W = dense_input.shape
     N = num_batches * batch_size
-
-    # Get conv module to prune
     conv_module = next(
         m for _, m in pruned_subnet.named_modules() if isinstance(m, nn.Conv2d)
     )
@@ -961,28 +957,13 @@ def prune_one_layer(
     total_xtx = get_coeff_h(pruned_X) / N
     total_xty = get_XtY(pruned_X, dense_X) / N
 
-    # # Optimal weights
-    # w_optimal = get_optimal_W(
-    #     gram_xx=total_xtx, gram_xy=total_xty, dense_weights=reshaped_conv_wt
-    # )
-
-    keep_mask, kept_channels, removed_channels = perform_local_search(
+    keep_mask, _, _ = perform_local_search(
         dense_weights=reshaped_conv_wt,
         layer=conv_module,
         p=layer_prune_channels,
         gram_xx=total_xtx,
         gram_xy=total_xty,
     )
-
-    # cached_out_pruned = []
-    # cached_out_dense = []
-
-    # for batch_idx in range(num_batches):
-    #     cached_out_pruned.append(pruned_subnet(pruned_input[batch_idx]))
-    #     cached_out_dense.append(dense_subnet(dense_input[batch_idx]))
-
-    # cached_out_pruned = torch.cat(cached_out_pruned, dim=0)
-    # cached_out_dense = torch.cat(cached_out_dense, dim=0)
 
     new_weight = conv_module.weight[:, keep_mask, :, :]
     if conv_module.bias is not None:
@@ -1018,11 +999,167 @@ def prune_one_layer(
     if new_bias is not None:
         new_conv_module.bias.data = new_bias.clone()
 
+    # Debugging note : Does replace_module still work aftet the inclusion of the placeholder
+    # + residual connection logic?
     replace_module(
         model=pruned_subnet, target_module=conv_module, new_module=new_conv_module
     )
 
     return pruned_subnet, keep_mask
+
+
+class DenseSubnetRunner(nn.Module):
+    def __init__(self, subnet_gm: torch.fx.GraphModule, external_nodes: dict):
+        super().__init__()
+        self.gm = subnet_gm
+        self.external_nodes = external_nodes
+        self.upstream_deps = external_nodes.values()
+        self.upstream_node_names = [node.name for node in self.upstream_deps]
+
+    def get_prefix_removed_name(self, prefix_name, prefix="external__"):
+        return prefix_name[len(prefix) :]
+
+    def forward(self, x, ctx: dict, batch_idx: int = 0):
+        """
+        Execute subnet with `x` and `ctx`, returning output + updated `ctx`.
+        """
+        inputs = {}
+        for node in self.gm.graph.nodes:
+            if node.op == "placeholder":
+                node_name = node.name
+                if self.get_prefix_removed_name(node_name) in self.upstream_node_names:
+                    ctx_tensor = ctx[node_name]
+                    inputs[node_name] = ctx_tensor[batch_idx]
+                else:
+                    inputs[node_name] = x
+
+        out = self.gm(**inputs)
+
+        if isinstance(out, dict):
+            for k, v in out.items():
+                if k != "output":
+                    if k not in ctx:
+                        ctx[k] = []
+                    ctx[k].append(v)
+            return out["output"], ctx
+
+        return out, ctx
+
+
+class SubnetRunner(nn.Module):
+    def __init__(
+        self,
+        subnet_gm: torch.fx.GraphModule,
+        external_nodes: dict,
+        pruned_conv_target,
+    ):
+        """
+        Runs a sliced FX subgraph and automatically supplies required inputs.
+
+        Parameters
+        ----------
+        subnet_gm : torch.fx.GraphModule
+            The sliced subgraph whose placeholders include:
+            - One real input placeholder (receives `x`)
+            - External placeholders (filled from `ctx`)
+        external_nodes : dict
+            Mapping: sliced_placeholder_name → original_node_name.
+            Used to fetch upstream activations from `ctx` during execution.
+
+        Notes
+        -----
+        - Placeholders not in `external_nodes.values()` get `x`.
+        - External placeholders get `ctx[original_name]`.
+        - Dict outputs store all keys except `"output"` into `ctx`.
+        """
+        super().__init__()
+        self.gm = subnet_gm
+        self.external_nodes = external_nodes
+        self.upstream_deps = external_nodes.values()
+        self.downstream_consumers = external_nodes.keys()
+        print("External nodes: ", self.external_nodes)
+        self.upstream_node_names = [node.name for node in self.upstream_deps]
+        self.pruned_conv_target = pruned_conv_target
+        print(f"Prune_target is {self.pruned_conv_target}")
+        self.placeholder_mask_map = self.build_placeholder_mask_map()
+
+    def build_placeholder_mask_map(self):
+        """
+        Returns:
+            dict[str, bool] : placeholder_name -> should_mask
+        """
+
+        graph = self.gm.graph
+
+        # Locate which node(conv2d layer) was pruned in this subnet
+        pruned_node = None
+        for node in graph.nodes:
+            if node.op == "call_module" and node.name == self.pruned_conv_target:
+                pruned_node = node
+                break
+
+        if pruned_node is None:
+            raise RuntimeError(
+                f"Pruned conv {self.pruned_conv_target} not found in subnet graph"
+            )
+
+        # Backward BFS - to locate all ancestors of the pruned_conv_target node
+        visited = set()
+        stack = [pruned_node]
+
+        while stack:
+            n = stack.pop()
+            if n in visited:
+                continue
+            visited.add(n)
+
+            for arg in n.all_input_nodes:
+                stack.append(arg)
+
+        placeholder_mask_map = {}
+
+        # Only masks
+        for node in graph.nodes:
+            if node.op == "placeholder":
+                placeholder_mask_map[node.name] = node in visited
+
+        return placeholder_mask_map
+
+    def get_prefix_removed_name(self, prefix_name, prefix="external__"):
+        return prefix_name[len(prefix) :]
+
+    def forward(self, x, ctx: dict, batch_idx: int = 0, keep_mask: list = []):
+        inputs = {}
+
+        for node in self.gm.graph.nodes:
+            if node.op != "placeholder":
+                continue
+
+            name = node.name
+
+            # Real inputs
+            if self.get_prefix_removed_name(name) not in self.upstream_node_names:
+                inputs[name] = x
+                continue
+
+            # This placeholder comes from ctx
+            tensor = ctx[name][batch_idx]
+
+            # Mask if BFS says so
+            if self.placeholder_mask_map.get(name, False):
+                tensor = tensor[:, keep_mask, :, :]
+
+            inputs[name] = tensor
+
+        out = self.gm(**inputs)
+
+        if isinstance(out, dict):
+            for k, v in out.items():
+                if k != "output":
+                    ctx.setdefault(k, []).append(v)
+            return out["output"], ctx
+
+        return out, ctx
 
 
 def is_real_consumer(node):
@@ -1043,6 +1180,8 @@ def get_external_nodes(gm: torch.fx.GraphModule):
     for node in gm.graph.nodes:
         real_users = [u for u in node.users if is_real_consumer(u)]
         if len(real_users) > 1:
-            external_nodes[node.name] = real_users
+            for user in real_users:
+                if "downsample" in str(user.target) or "add" in str(user.target):
+                    external_nodes[user.name] = node
 
     return external_nodes
